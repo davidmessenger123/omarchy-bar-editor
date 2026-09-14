@@ -13,6 +13,9 @@ Keys:
     hjkl / arrows     move cursor
     Tab               switch pane (layout <-> settings)
     Enter             edit selected setting / confirm
+    Space             select a widget in the layout (highlighted ▸);
+                      with a widget selected, ←/→ or h/l move it into the
+                      neighbouring column
     a or +            add widget to the focused section
     x or Delete       remove selected widget
     - / =             move widget up / down within its section
@@ -476,6 +479,8 @@ class BarEditorTUI:
         self.sec_i = 0
         self.lay_i = 0
         self.lay_scroll = {sec: 0 for sec in SECTIONS}
+        self.sel_sec = None           # widget carried for cross-column move
+        self.sel_idx = -1
         self.set_i = 0
         self.set_scroll = 0
         self.row_rects = [[] for _ in SECTIONS]
@@ -559,7 +564,7 @@ class BarEditorTUI:
     def draw_header(self):
         w = self.max_x
         title = " OMARCHY  BAR EDITOR "
-        hints = "  Tab pane · a add · x remove · -/+ move · [ ] section · p plugins "
+        hints = "  Tab pane · a add · x remove · space select · ←/→ move · p plugins "
         self._put(0, 0, " " * w, 0)
         self._put(0, 1, title, curses.A_BOLD, PAIR.get("cyan", 0))
         pad = max(0, w - len(title) - 3 - len(hints))
@@ -695,10 +700,16 @@ class BarEditorTUI:
             ident = entry_id(lst[real])
             selected = (self.side == "layout" and si == self.sec_i
                         and self.lay_i == real and not self.ov)
+            carried = (self.sel_sec == sec and self.sel_idx == real)
             usable = max(1, right - left + 1)
             name = display_name(self.model.catalog, ident)
-            line = name if len(name) <= usable else name[: usable - 1] + "…"
-            if selected:
+            mark = "▸" if carried else " "
+            line = mark + " " + name
+            if len(line) > usable:
+                line = (mark + " " + name)[: usable - 1] + "…"
+            if carried:
+                self._put(y, left, line, curses.A_BOLD, PAIR.get("accent", 0))
+            elif selected:
                 self._put(y, left, line, curses.A_REVERSE)
             else:
                 self._put(y, left, line, 0, cat_pair(category_of(self.model.catalog, ident)))
@@ -840,6 +851,12 @@ class BarEditorTUI:
         elif ch in (curses.KEY_DOWN, ord("j"), ord("J")):
             if self.lay_i < len(lst) - 1:
                 self.lay_i += 1
+        elif ch in (curses.KEY_LEFT, ord("h"), ord("H")) and self.sel_sec is not None:
+            if self._move_selected(-1):
+                return
+        elif ch in (curses.KEY_RIGHT, ord("l"), ord("L")) and self.sel_sec is not None:
+            if self._move_selected(1):
+                return
         elif ch in (curses.KEY_LEFT, ord("h"), ord("H")):
             if self.sec_i > 0:
                 self.sec_i -= 1
@@ -848,10 +865,14 @@ class BarEditorTUI:
             if self.sec_i < len(SECTIONS) - 1:
                 self.sec_i += 1
                 self.lay_i = min(self.lay_i, max(0, len(self.model.layout[SECTIONS[self.sec_i]]) - 1))
+        elif ch in (ord(" "),):
+            self._toggle_select(sec, self.lay_i)
         elif ch in (ord("a"), ord("A"), ord("+")):
             self.open_add(sec)
         elif ch in (curses.KEY_DC, ord("x"), ord("X"), ord("d"), ord("D")):
             self.model.remove_widget(sec, self.lay_i)
+            if self.sel_sec == sec and self.sel_idx == self.lay_i:
+                self.sel_sec, self.sel_idx = None, -1
             self.lay_i = max(0, min(self.lay_i, max(0, len(self.model.layout[sec]) - 1)))
         elif ch in (ord("-"), ord("_")):
             self.model.move_widget(sec, self.lay_i, -1)
@@ -868,6 +889,34 @@ class BarEditorTUI:
                 self.sec_i += 1
                 self.lay_i = min(self.lay_i, max(0, len(self.model.layout[SECTIONS[self.sec_i]]) - 1))
         self.need_refresh = True
+
+    def _toggle_select(self, sec, idx):
+        if not (0 <= idx < len(self.model.layout[sec])):
+            return
+        if self.sel_sec == sec and self.sel_idx == idx:
+            self.sel_sec, self.sel_idx = None, -1
+            self.model.status = "Selection cleared"
+        else:
+            self.sel_sec, self.sel_idx = sec, idx
+            self.model.status = f"Selected — move with ←/→ or h/l"
+        self.need_refresh = True
+
+    def _move_selected(self, delta):
+        if self.sel_sec is None:
+            return False
+        src_idx = SECTIONS.index(self.sel_sec)
+        dst_idx = src_idx + delta
+        if not (0 <= dst_idx < len(SECTIONS)):
+            return False
+        if not (0 <= self.sel_idx < len(self.model.layout[self.sel_sec])):
+            self.sel_sec, self.sel_idx = None, -1
+            return False
+        target = SECTIONS[dst_idx]
+        self.model.move_section(self.sel_sec, self.sel_idx, target)
+        self.sel_sec, self.sel_idx = target, len(self.model.layout[target]) - 1
+        self.sec_i, self.lay_i = dst_idx, self.sel_idx
+        self.model.status = "Moved to " + SECTION_LABELS[target]
+        return True
 
     def key_settings(self, ch):
         rows = self.settings_rows()
