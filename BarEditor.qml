@@ -156,9 +156,9 @@ BarWidget {
     lockField.value = idle.lock || 0
 
     var tv = root.toml.values || {}
-    bgColorField.text = tv.background || "#1a1b26"
-    textColorField.text = tv.text || "#c0caf5"
-    activeColorField.text = tv.active || "#f7768e"
+    bgColorField.value = tv.background || "#1a1b26"
+    textColorField.value = tv.text || "#c0caf5"
+    activeColorField.value = tv.active || "#f7768e"
     alphaField.value = Math.round(parseFloat(tv.background_alpha || "1.0") * 100)
     sizeHField.value = parseInt(tv.size_horizontal || "26", 10)
     sizeVField.value = parseInt(tv.size_vertical || "28", 10)
@@ -209,9 +209,9 @@ BarWidget {
 
   function gatherToml() {
     return {
-      background: bgColorField.text.trim() || "#1a1b26",
-      text: textColorField.text.trim() || "#c0caf5",
-      active: activeColorField.text.trim() || "#f7768e",
+      background: bgColorField.value,
+      text: textColorField.value,
+      active: activeColorField.value,
       background_alpha: String(Math.round(alphaField.value) / 100),
       size_horizontal: String(sizeHField.value),
       size_vertical: String(sizeVField.value),
@@ -442,7 +442,8 @@ BarWidget {
               text: "Save"
               tooltipText: "Save changes (Ctrl+S)"
               bordered: true
-              selected: true
+              foreground: Color.accent
+              accent: Color.accent
               fontFamily: root.fontFamily
               fontSize: Style.font.caption
               horizontalPadding: Style.space(14)
@@ -477,8 +478,10 @@ BarWidget {
                 Layout.fillWidth: true
                 radius: Style.cornerRadius
                 color: Util.alpha(Color.foreground, 0.05)
+                implicitHeight: barSettingsCol.implicitHeight + 2 * Style.space(12)
 
                 ColumnLayout {
+                  id: barSettingsCol
                   anchors.fill: parent
                   anchors.margins: Style.space(12)
                   spacing: Style.space(10)
@@ -502,13 +505,25 @@ BarWidget {
                     onClicked: { root.transparentValue = !root.transparentValue; root.markDirty() }
                   }
 
-                  TextField {
-                    id: anchorField
+                  ColumnLayout {
+                    spacing: Style.spacing.labelGap
                     Layout.fillWidth: true
-                    font.pixelSize: Style.font.bodySmall
-                    placeholderText: "Center anchor (e.g. omarchy.clock)"
-                    selectByMouse: true
-                    onTextChanged: root.markDirty()
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Center anchor widget"
+                      color: Qt.darker(Color.foreground, 1.4)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                    TextField {
+                      id: anchorField
+                      Layout.fillWidth: true
+                      font.pixelSize: Style.font.bodySmall
+                      placeholderText: "e.g. omarchy.clock"
+                      selectByMouse: true
+                      onTextChanged: root.markDirty()
+                    }
                   }
 
                   Dropdown {
@@ -527,8 +542,10 @@ BarWidget {
                 Layout.fillWidth: true
                 radius: Style.cornerRadius
                 color: Util.alpha(Color.foreground, 0.05)
+                implicitHeight: idleCol.implicitHeight + 2 * Style.space(12)
 
                 ColumnLayout {
+                  id: idleCol
                   anchors.fill: parent
                   anchors.margins: Style.space(12)
                   spacing: Style.space(10)
@@ -564,29 +581,26 @@ BarWidget {
 
                   PanelSectionHeader { text: "BAR STYLING (shell.toml)" }
 
-                  TextField {
+                  ColorPicker {
                     id: bgColorField
                     Layout.fillWidth: true
-                    font.pixelSize: Style.font.bodySmall
-                    placeholderText: "Background #rrggbb"
-                    selectByMouse: true
-                    onTextChanged: root.markDirty()
+                    label: "Background"
+                    value: "#1a1b26"
+                    onChanged: root.markDirty()
                   }
-                  TextField {
+                  ColorPicker {
                     id: textColorField
                     Layout.fillWidth: true
-                    font.pixelSize: Style.font.bodySmall
-                    placeholderText: "Text #rrggbb"
-                    selectByMouse: true
-                    onTextChanged: root.markDirty()
+                    label: "Text"
+                    value: "#c0caf5"
+                    onChanged: root.markDirty()
                   }
-                  TextField {
+                  ColorPicker {
                     id: activeColorField
                     Layout.fillWidth: true
-                    font.pixelSize: Style.font.bodySmall
-                    placeholderText: "Active #rrggbb"
-                    selectByMouse: true
-                    onTextChanged: root.markDirty()
+                    label: "Active"
+                    value: "#f7768e"
+                    onChanged: root.markDirty()
                   }
                   NumberField {
                     id: alphaField
