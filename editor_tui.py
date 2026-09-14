@@ -945,6 +945,7 @@ class BarEditorTUI:
             return
         if self.ov:
             self.ov.key(self.s, ch)
+            self.need_refresh = True
             return
 
         if ctrl == 19:  # Ctrl+S
@@ -1400,6 +1401,7 @@ class BarEditorTUI:
         if self.prompt or self.ov:
             if self.ov:
                 self.ov.mouse(self.s, my, mx, bstate)
+                self.need_refresh = True
             return
 
         # drag-and-drop: press on a layout row, release over another row
