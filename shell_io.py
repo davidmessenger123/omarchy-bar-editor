@@ -21,6 +21,10 @@ Commands (argv subcommand, payload on stdin, JSON on stdout):
              "profiles": [names]}.
       Missing files come back as empty defaults, never errors.
 
+  Note: stdin is parsed incrementally with read_stdin_json() — the QML
+  Process keeps the pipe open for the process lifetime, so payloads must
+  never rely on EOF (json.load(sys.stdin) would block forever).
+
   write                                stdin: {"shell": <obj>, "toml": {"values":...}}
       atomically write shell.json and/or shell.toml (each with a `.bak-editor`
       backup). Keys not present in the payload are left untouched.
@@ -231,8 +235,29 @@ def cmd_read():
     print(json.dumps(out, ensure_ascii=False))
 
 
+def read_stdin_json():
+    """Parse one JSON value from stdin without requiring EOF.
+
+    The QML Process keeps stdin open for the process lifetime, so json.load()
+    would block forever. Read in chunks and stop as soon as a complete value
+    is decoded.
+    """
+    decoder = json.JSONDecoder()
+    buf = ""
+    while True:
+        chunk = sys.stdin.read(65536)
+        if not chunk:
+            raise SystemExit("stdin closed before complete JSON")
+        buf += chunk
+        try:
+            value, end = decoder.raw_decode(buf)
+            return value
+        except json.JSONDecodeError:
+            continue
+
+
 def cmd_write():
-    payload = json.load(sys.stdin)
+    payload = read_stdin_json()
     if not isinstance(payload, dict):
         raise SystemExit("invalid write payload")
 
@@ -302,7 +327,7 @@ def cmd_profiles(args):
     path = os.path.join(PROFILES_DIR, name + ".json")
 
     if cmd == "save":
-        payload = json.load(sys.stdin)
+        payload = read_stdin_json()
         if not isinstance(payload, dict):
             raise SystemExit("profile must be an object")
         verify_parent_dir(path)
