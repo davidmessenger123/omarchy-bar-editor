@@ -10,7 +10,8 @@ All reads/writes go through shell_io.py (the plugin's hardened config
 boundary); this file never touches ~/.config/omarchy directly.
 
 Keys:
-    hjkl / arrows     move cursor
+    hjkl / arrows     move cursor; at the left edge ← jumps to the settings
+                      pane, → returns to the layout
     Tab               switch pane (layout <-> settings)
     Enter             edit selected setting / confirm
     Space             select a widget in the layout (highlighted ▸);
@@ -565,7 +566,7 @@ class BarEditorTUI:
     def draw_header(self):
         w = self.max_x
         title = " OMARCHY  BAR EDITOR "
-        hints = "  Tab pane · a add · x remove · space select · ←/→ move · p plugins "
+        hints = "  ←/→ pane/column · Tab pane · a add · x remove · space select · p plugins "
         self._put(0, 0, " " * w, 0)
         self._put(0, 1, title, curses.A_BOLD, PAIR.get("cyan", 0))
         pad = max(0, w - len(title) - 3 - len(hints))
@@ -862,6 +863,8 @@ class BarEditorTUI:
             if self.sec_i > 0:
                 self.sec_i -= 1
                 self.lay_i = min(self.lay_i, max(0, len(self.model.layout[SECTIONS[self.sec_i]]) - 1))
+            else:
+                self.side = "settings"
         elif ch in (curses.KEY_RIGHT, ord("l"), ord("L")):
             if self.sec_i < len(SECTIONS) - 1:
                 self.sec_i += 1
@@ -927,6 +930,10 @@ class BarEditorTUI:
         elif ch in (curses.KEY_DOWN, ord("j"), ord("J")):
             if self.set_i < len(rows) - 1:
                 self.set_i += 1
+        elif ch in (curses.KEY_RIGHT, ord("l"), ord("L")):
+            self.side = "layout"
+            self.sec_i = 0
+            self.lay_i = min(self.lay_i, max(0, len(self.model.layout["left"]) - 1))
         elif ch in (10, ord("\n"), 13, ord(" ")):
             self.edit_setting(rows[self.set_i][0])
         self.need_refresh = True

@@ -61,7 +61,7 @@ the UI directly.
 | Key | Action |
 |---|---|
 | `Tab` | switch between the layout and settings panes |
-| `hjkl` / arrows | move cursor |
+| `hjkl` / arrows | move cursor; ← at the left edge enters the settings pane, → returns to the layout |
 | `Space` | select a widget (marked with ▸); with a widget selected, `←/→` move it into the neighbouring column |
 | `Enter` | edit the selected setting |
 | `a` / `+` | add a widget to the focused section |
