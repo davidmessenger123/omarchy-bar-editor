@@ -15,8 +15,8 @@ Keys:
     Tab               switch pane (layout <-> settings)
     Enter             edit selected setting / confirm
     Space             select a widget in the layout (highlighted ▸);
-                      with a widget selected, ←/→ or h/l move it into the
-                      neighbouring column
+                      with a widget selected, ←/→ or h/l move it between
+                      columns, ↑/↓ or j/k reorder it within its column
     a or +            add widget to the focused section
     x or Delete       remove selected widget
     - / =             move widget up / down within its section
@@ -847,7 +847,13 @@ class BarEditorTUI:
         sec = SECTIONS[self.sec_i]
         lst = self.model.layout[sec]
         mod = []
-        if ch in (curses.KEY_UP, ord("k"), ord("K")):
+        if ch in (curses.KEY_UP, ord("k"), ord("K")) and self.sel_sec is not None:
+            if self._move_selected_vertical(-1):
+                return
+        elif ch in (curses.KEY_DOWN, ord("j"), ord("J")) and self.sel_sec is not None:
+            if self._move_selected_vertical(1):
+                return
+        elif ch in (curses.KEY_UP, ord("k"), ord("K")):
             if self.lay_i > 0:
                 self.lay_i -= 1
         elif ch in (curses.KEY_DOWN, ord("j"), ord("J")):
@@ -902,7 +908,7 @@ class BarEditorTUI:
             self.model.status = "Selection cleared"
         else:
             self.sel_sec, self.sel_idx = sec, idx
-            self.model.status = f"Selected — move with ←/→ or h/l"
+            self.model.status = "Selected — ←/→ column · ↑/↓ reorder · Space drop"
         self.need_refresh = True
 
     def _move_selected(self, delta):
@@ -920,6 +926,20 @@ class BarEditorTUI:
         self.sel_sec, self.sel_idx = target, len(self.model.layout[target]) - 1
         self.sec_i, self.lay_i = dst_idx, self.sel_idx
         self.model.status = "Moved to " + SECTION_LABELS[target]
+        return True
+
+    def _move_selected_vertical(self, delta):
+        if self.sel_sec is None:
+            return False
+        idx = self.sel_idx
+        target = idx + delta
+        lst = self.model.layout[self.sel_sec]
+        if not (0 <= idx < len(lst)) or not (0 <= target < len(lst)):
+            return False
+        self.model.move_widget(self.sel_sec, idx, delta)
+        self.sel_idx = target
+        self.sec_i, self.lay_i = SECTIONS.index(self.sel_sec), target
+        self.model.status = "Moved within " + SECTION_LABELS[self.sel_sec]
         return True
 
     def key_settings(self, ch):

@@ -54,7 +54,8 @@ the UI directly.
 - Mouse support: click rows to select, click a section to focus it, scroll to
   browse long lists
 - Select-and-move: press Space to grab a widget, then use `←/→` (or `h/l`)
-  to move it into a different column; Space again to drop
+  to move it into a different column and `↑/↓` (or `j/k`) to reorder it within
+  its column; Space again to drop
 
 ## Keys
 
@@ -62,7 +63,7 @@ the UI directly.
 |---|---|
 | `Tab` | switch between the layout and settings panes |
 | `hjkl` / arrows | move cursor; ← at the left edge enters the settings pane, → returns to the layout |
-| `Space` | select a widget (marked with ▸); with a widget selected, `←/→` move it into the neighbouring column |
+| `Space` | select a widget (marked with ▸); with a widget selected, `←/→` move it into the neighbouring column and `↑/↓` reorder it within its column |
 | `Enter` | edit the selected setting |
 | `a` / `+` | add a widget to the focused section |
 | `x` / `Delete` | remove the selected widget |
