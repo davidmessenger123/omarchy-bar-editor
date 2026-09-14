@@ -1,49 +1,29 @@
 # Omarchy Bar Editor
 
-A GTK4 desktop app that visually edits the Omarchy status bar: layout,
-widgets, per-widget options, bar styling, idle timeouts, and plugins.
+A native Omarchy shell plugin that visually edits the status bar: layout
+widgets across the left/center/right sections, bar position and transparency,
+center anchor, idle timeouts, `[bar]` styling in `shell.toml`, and plugins.
 
-## Requirements
-
-- Python 3 and PyGObject (`python-gobject`)
-- GTK 4 (`gtk4`)
-- [Omarchy](https://omarchy.org) (for the `omarchy` and `omarchy-plugin-catalog` commands)
-
-Arch Linux:
-
-```sh
-sudo pacman -S --needed python-gobject gtk4 omarchy
-```
+Click the **Bar Editor** icon in the bar to open a full-screen editor. Layout
+changes save to `~/.config/omarchy/shell.json` and are hot-reloaded by the
+shell.
 
 ## Install
 
-Clone the repo, then symlink (or copy) the script onto your PATH and install
-the desktop entry:
+From the Omarchy plugin marketplace (via the `omarchy plugin` CLI), or
+manually:
 
 ```sh
-git clone https://github.com/davidmessenger123/omarchy-bar-editor.git ~/Work/omarchy-bar-editor
-ln -sf ~/Work/omarchy-bar-editor/omarchy-bar-editor ~/.local/bin/omarchy-bar-editor
-mkdir -p ~/.local/share/applications
-cp omarchy-bar-editor.desktop ~/.local/share/applications/  # edit the Exec line's HOME path as needed
+git clone https://github.com/davidmessenger123/omarchy-bar-editor.git \
+  ~/.config/omarchy/plugins/davidjm.bar-editor
+omarchy plugin enable davidjm.bar-editor
+omarchy bar put davidjm.bar-editor
 ```
 
-Run it with `omarchy-bar-editor`, or launch it from your app menu as "Omarchy
-Bar Editor".
+## Requirements
 
-### Option: copy instead of symlink
-
-If you'd rather not keep the checkout around, copy the script instead of
-symlinking it. The in-app Update button only works when the script is running
-from a git checkout (symlinked or not).
-
-## Update
-
-- Click **Update** in the app's header bar: it fetches `origin/main`, pulls
-  the latest commits into the checkout, and restarts itself to apply them.
-- Or manually: `git -C ~/Work/omarchy-bar-editor pull origin main`.
-
-Changes to `shell.json` are hot-reloaded by the Omarchy shell on save, so most
-edits apply live.
+- [Omarchy](https://omarchy.org) (for the shell, `omarchy` and
+  `omarchy-plugin-catalog` commands), plus its Qt Quick shell runtime.
 
 ## Files the editor manages
 
@@ -53,20 +33,33 @@ edits apply live.
 | `~/.config/omarchy/shell.json.bak-editor` | Backup created on every save |
 | `~/.config/omarchy/shell.toml` | `[bar]` colors, alpha, sizing |
 | `~/.config/omarchy/shell.toml.bak-editor` | Backup created on every save |
-| `~/.config/omarchy/bar-profiles/*.json` | Named layout profiles |
-| `~/.local/state/omarchy/toggles/bar-off` | Bar show/hide flag |
+
+All writes go through `shell_io.py` (atomic replace, symlink-safe), never done
+from QML directly.
 
 ## Features
 
-- Bar position, transparency, center anchor, and active bar host
+- Bar position, transparency, center anchor
 - Screensaver / lock idle timeouts
 - Widget layout editing for the left / center / right sections:
-  add, remove, reorder, move, and drag-and-drop between sections
-- Per-widget options with typed editors (boolean, integer, enum, multiselect, text)
+  add, remove, reorder (up/down), and move between sections
+- Add-widget global search with per-section "Add widget" dropdowns
 - `[bar]` styling in `shell.toml`: colors, background alpha, sizing, scale-with-font
-- Plugin enable/disable (`plugins[]` / `disabledPlugins[]`)
-- Global cross-section search, undo/redo, named layout profiles, save diff
-- In-app update (git pull in the checkout + self-restart)
+- Undo/redo (100-step), save/reload, reset-to-defaults with confirmation
+- Bar show/hide, plugin enable/disable
+
+## Development
+
+- `BarEditor.qml` — the bar widget and full-screen editor UI
+- `Editor.js` — pure QML logic helpers (`.pragma library`)
+- `shell_io.py` — the only process that writes to `shell.json` / `shell.toml`;
+  a hardened, non-QML boundary invoked via `QProcess`
+
+Validate locally:
+
+```sh
+omarchy plugin validate .
+```
 
 ## License
 
