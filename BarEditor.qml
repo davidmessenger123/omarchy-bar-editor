@@ -25,7 +25,11 @@ BarWidget {
     horizontalMargin: 8.25
     verticalPadding: 7.5
     onPressed: function(mouseButton) {
-      Quickshell.execDetached([root.pluginDir + "bin/omarchy-bar-editor"])
+      Quickshell.execDetached([
+        "omarchy-launch-tui",
+        "--app-id=org.omarchy.bar-editor",
+        root.pluginDir + "bin/omarchy-bar-editor"
+      ])
     }
   }
 }

@@ -5,14 +5,14 @@
   "version": "1.0.0",
   "author": "David JM",
   "license": "MIT",
-  "description": "Visual editor for the Omarchy bar: layout widgets across the left/center/right sections, bar position and transparency, idle timeouts, [bar] styling in shell.toml, and plugins.",
+  "description": "Terminal editor for the Omarchy bar: layout widgets across the left/center/right sections, bar position and transparency, idle timeouts, and [bar] styling in shell.toml.",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "BarEditor.qml"
   },
   "barWidget": {
     "displayName": "Bar Editor",
-    "description": "One bar icon that opens a full-screen editor for the bar layout, settings, styling, idle timeouts, and plugins. Changes are saved to ~/.config/omarchy/shell.json and shell.toml and hot-reloaded by the shell.",
+    "description": "One bar icon that opens a mouse-aware terminal editor for the bar layout, settings, styling, and idle timeouts. Changes are saved to ~/.config/omarchy/shell.json and shell.toml and hot-reloaded by the shell.",
     "category": "System",
     "allowMultiple": false,
     "schema": []

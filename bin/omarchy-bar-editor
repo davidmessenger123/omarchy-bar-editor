@@ -1,34 +1,14 @@
 #!/usr/bin/env bash
-# Omarchy Bar Editor — standalone launcher.
+# Omarchy Bar Editor — terminal launcher.
 #
-# Runs the editor as an independent quickshell app so a shell hot-reload on
-# Save cannot tear the editor down mid-write. The plugin must not contain
-# symlinks (omarchy plugin validate rejects them), so the config directory
-# that resolves qs.Commons / qs.Ui is materialised at runtime under
-# ~/.cache. `-n` makes a second launch a no-op while one instance is already
-# running (keyed on config path).
+# Runs the bar editor as a TUI (stdlib curses, mouse-aware) inside the user's
+# default terminal. It is a self-contained process independent of the shell,
+# so a shell hot-reload on Save can never tear it down. The gear widget and
+# the desktop entry wrap this with omarchy-launch-tui so it appears as a real
+# application window.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-RUNTIME_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/bar-editor"
 
-mkdir -p "$RUNTIME_DIR"
-
-for name in Commons Ui; do
-  ln -sfn "/usr/share/omarchy/shell/$name" "$RUNTIME_DIR/$name"
-done
-
-cat > "$RUNTIME_DIR/shell.qml" <<EOF
-import QtQuick
-import Quickshell
-
-Loader {
-  anchors.fill: parent
-  property string realSource: "file://" + String(Quickshell.env("OMARCHY_BAR_EDITOR_PLUGIN_DIR")) + "/EditorApp.qml"
-  source: realSource
-}
-EOF
-
-export OMARCHY_BAR_EDITOR_PLUGIN_DIR="$PLUGIN_DIR"
-exec quickshell -n -p "$RUNTIME_DIR"
+exec python3 "$PLUGIN_DIR/editor_tui.py" "$@"
