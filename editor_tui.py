@@ -30,6 +30,7 @@ import json
 import os
 import subprocess
 import sys
+import termios
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 SHELL_IO = os.path.join(PLUGIN_DIR, "shell_io.py")
@@ -1236,6 +1237,14 @@ def init_colors():
 
 def _main(stdscr):
     curses.curs_set(0)
+    # disable IXON so Ctrl+S / Ctrl+Q reach curses (not swallowed as XON/XOFF)
+    try:
+        fd = sys.stdin.fileno()
+        attrs = termios.tcgetattr(fd)
+        attrs[0] &= ~(termios.IXON | termios.IXOFF)
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except termios.error:
+        pass
     if curses.has_colors():
         init_colors()
     curses.mousemask(
