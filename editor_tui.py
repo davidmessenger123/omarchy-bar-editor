@@ -13,16 +13,21 @@ Keys:
     hjkl / arrows     move cursor; at the left edge ← jumps to the settings
                       pane, → returns to the layout
     Tab               switch pane (layout <-> settings)
-    Enter             edit selected setting / confirm
+    Enter             edit selected setting / confirm / widget options
     Space             select a widget in the layout (highlighted ▸);
                       with a widget selected, ←/→ or h/l move it between
                       columns, ↑/↓ or j/k reorder it within its column
+    e                 edit the focused widget's options
+    c                 duplicate the focused widget
     a or +            add widget to the focused section
     x or Delete       remove selected widget
     - / =             move widget up / down within its section
     [ / ]             move widget to previous / next section
     p                 plugin enable/disable
+    r                 reset bar to defaults (confirm)
+    b                 toggle bar visibility
     Ctrl+S save  Ctrl+R reload  Ctrl+Z undo  Ctrl+Y redo
+    Ctrl+P            profiles: Enter loads, x deletes (double), c saves as
     Esc               close overlay / quit (after confirming unsaved work)
 """
 
@@ -128,6 +133,17 @@ def load_plugin_states():
     return {e["id"]: e["enabled"] for e in entries if e and e.get("enabled") is not None}
 
 
+def load_profiles():
+    rc, out, err = run([sys.executable, SHELL_IO, "profiles", "list"])
+    if rc != 0 or not out:
+        return []
+    try:
+        names = json.loads(out)
+    except json.JSONDecodeError:
+        return []
+    return [n for n in names if isinstance(n, str)]
+
+
 # ---------------------------------------------------------------------------
 # pure helpers (mirror Editor.js)
 # ---------------------------------------------------------------------------
@@ -196,6 +212,23 @@ def _num_str(values, key, default):
     return str(v)
 
 
+def schema_type(field, value=None):
+    t = str(field.get("type") or "").lower()
+    if t == "enum":
+        return "enum"
+    if t in ("bool", "boolean"):
+        return "bool"
+    if t in ("int", "integer"):
+        return "int"
+    if t in ("number", "float", "double"):
+        return "num"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (int, float)):
+        return "num"
+    return "text"
+
+
 # ---------------------------------------------------------------------------
 # application model
 # ---------------------------------------------------------------------------
@@ -225,6 +258,8 @@ class Model:
         self.scale_font = True
 
         self.layout = {sec: [] for sec in SECTIONS}
+
+        self._profiles = []
 
         self.undo = []
         self.redo = []
@@ -278,6 +313,7 @@ class Model:
             self.states = load_plugin_states()
         except Exception:
             self.catalog, self.states = {}, {}
+        self.refresh_profiles()
         self.apply_from_cfg()
 
     def apply_from_cfg(self):
@@ -423,6 +459,110 @@ class Model:
         self.layout[target_sec].append(item)
         self.mark_dirty()
 
+    def drop_widget(self, src_sec, src_idx, dst_sec, dst_idx):
+        """Move a widget to another section (or reorder in place), inserting at
+        dst_idx (== len(dst) appends). Returns the widget's new index."""
+        if src_sec not in SECTIONS or dst_sec not in SECTIONS:
+            return None
+        src = self.layout[src_sec]
+        if not (0 <= src_idx < len(src)):
+            return None
+        self.push_history()
+        item = src.pop(src_idx)
+        dst = self.layout[dst_sec]
+        pos = max(0, min(dst_idx, len(dst)))
+        dst.insert(pos, item)
+        self.mark_dirty()
+        return pos
+
+    def duplicate_widget(self, sec, idx):
+        if not (0 <= idx < len(self.layout[sec])):
+            return
+        self.push_history()
+        item = self.layout[sec][idx]
+        copy = json.loads(json.dumps(item)) if isinstance(item, dict) else {"id": item}
+        self.layout[sec].append(copy)
+        self.mark_dirty()
+
+    def widget_schema(self, wid):
+        info = widget_info(self.catalog, wid)
+        bw = info.get("barWidget") or {}
+        s = bw.get("schema")
+        if isinstance(s, dict):
+            s = [s]
+        if not isinstance(s, list):
+            return []
+        return [f for f in s if isinstance(f, dict) and f.get("key")]
+
+    def widget_options(self, sec, idx):
+        entry = self.layout[sec][idx]
+        if not isinstance(entry, dict):
+            entry = {}
+        wid = entry_id(self.layout[sec][idx])
+        opts = []
+        for f in self.widget_schema(wid):
+            key = f["key"]
+            value = entry.get(key)
+            if value is None:
+                value = f.get("defaultValue")
+            opts.append({
+                "key": key,
+                "label": f.get("label") or key,
+                "type": schema_type(f, value),
+                "enum": f.get("options") or [],
+                "min": f.get("min"),
+                "max": f.get("max"),
+                "value": value,
+            })
+        return opts
+
+    def apply_widget_option(self, sec, idx, key, value):
+        if not (0 <= idx < len(self.layout[sec])):
+            return
+        entry = self.layout[sec][idx]
+        if not isinstance(entry, dict):
+            entry = {"id": entry}
+            self.layout[sec][idx] = entry
+        self.push_history()
+        entry[key] = value
+        self.mark_dirty()
+
+    def refresh_profiles(self):
+        self._profiles = load_profiles()
+        return self._profiles
+
+    def save_profile(self, name):
+        payload = {
+            "shell": self.gather_cfg(),
+            "toml": {"values": self.gather_toml()},
+        }
+        rc, out, err = run(
+            [sys.executable, SHELL_IO, "profiles", "save", name], payload)
+        if rc != 0:
+            raise RuntimeError(err.strip() or "profile save failed")
+
+    def load_profile(self, name):
+        rc, out, err = run([sys.executable, SHELL_IO, "profiles", "load", name])
+        if rc != 0:
+            raise RuntimeError(err.strip() or f"no profile named {name}")
+        try:
+            data = json.loads(out) if isinstance(out, str) else out
+        except json.JSONDecodeError:
+            raise RuntimeError("corrupt profile")
+        if not isinstance(data, dict):
+            raise RuntimeError("corrupt profile")
+        self.cfg = ensure_cfg(data.get("shell") or {})
+        self.toml = {"values": (data.get("toml") or {}).get("values") or {},
+                     "exists": True}
+        self.apply_from_cfg()
+        self.mark_dirty()
+        self.status = "Loaded profile — save to apply"
+
+    def delete_profile(self, name):
+        rc, out, err = run([sys.executable, SHELL_IO, "profiles", "delete", name])
+        if rc != 0:
+            raise RuntimeError(err.strip() or f"no profile named {name}")
+
     # -- display data ------------------------------------------------------
     def add_options(self):
         placed = {}
@@ -488,6 +628,10 @@ class BarEditorTUI:
         self.row_rects = [[] for _ in SECTIONS]
         self.search = ""
         self.search_active = False
+        self.drag_sec = None        # mouse drag-and-drop state
+        self.drag_idx = -1
+        self.drag_oy = self.drag_ox = -1
+        self.pending_delete = None  # double-press x to delete a profile
 
         self.ov = None
         self.prompt = None
@@ -566,7 +710,7 @@ class BarEditorTUI:
     def draw_header(self):
         w = self.max_x
         title = " OMARCHY  BAR EDITOR "
-        hints = "  ←/→ pane/column · Tab pane · a add · x remove · space select · p plugins "
+        hints = "  ←/→/↑/↓ move · a add · e opts · c dup · p plugins "  # noqa: E501
         self._put(0, 0, " " * w, 0)
         self._put(0, 1, title, curses.A_BOLD, PAIR.get("cyan", 0))
         pad = max(0, w - len(title) - 3 - len(hints))
@@ -768,6 +912,14 @@ class BarEditorTUI:
                 self.prompt = None
                 self.need_refresh = True
                 return
+        elif kind == "num":
+            try:
+                text = float(text)
+            except ValueError:
+                self.model.status = "Not a number"
+                self.prompt = None
+                self.need_refresh = True
+                return
         elif kind == "hex":
             text = text.strip().lstrip("#")
             if len(text) not in (3, 6) or any(c not in "0123456789abcdefABCDEF" for c in text):
@@ -814,8 +966,14 @@ class BarEditorTUI:
         elif ch in (ord("\t"), curses.KEY_BTAB):
             self.side = "settings" if self.side == "layout" else "layout"
             self.need_refresh = True
+        elif ctrl == 16:  # Ctrl+P
+            self.open_profiles()
         elif ch == ord("p"):
             self.open_plugins()
+        elif ch in (ord("r"), ord("R")):
+            self.action_reset()
+        elif ch == ord("b"):
+            self.model.toggle_bar()
         elif self.side == "layout":
             self.key_layout(ch)
         else:
@@ -898,6 +1056,12 @@ class BarEditorTUI:
                 self.model.move_section(sec, self.lay_i, SECTIONS[self.sec_i + 1])
                 self.sec_i += 1
                 self.lay_i = min(self.lay_i, max(0, len(self.model.layout[SECTIONS[self.sec_i]]) - 1))
+        elif ch in (10, ord("\n"), 13):
+            self.open_widget_options(sec, self.lay_i)
+        elif ch in (ord("e"), ord("E")):
+            self.open_widget_options(sec, self.lay_i)
+        elif ch in (ord("c"), ord("C")):
+            self._duplicate(sec, self.lay_i)
         self.need_refresh = True
 
     def _toggle_select(self, sec, idx):
@@ -1039,8 +1203,8 @@ class BarEditorTUI:
         self.need_refresh = True
 
     def _pick_dropdown(self, on_pick, value):
-        on_pick(value)
         self.ov = None
+        on_pick(value)
         self.need_refresh = True
 
     def open_plugins(self):
@@ -1056,6 +1220,161 @@ class BarEditorTUI:
         self.model.plugin_set(row["id"], not row["enabled"])
         if self.ov:
             self.ov.rows = self.model.plugins()
+        self.need_refresh = True
+
+    def open_widget_options(self, sec, idx):
+        lst = self.model.layout[sec]
+        if not (0 <= idx < len(lst)):
+            return
+        wid = entry_id(lst[idx])
+        opts = self.model.widget_options(sec, idx)
+        if not opts:
+            self.model.status = f"{display_name(self.model.catalog, wid)} has no options"
+            self.need_refresh = True
+            return
+        self.ov = ListOverlay(
+            f"OPTIONS — {display_name(self.model.catalog, wid)}", opts,
+            key={"label": "label", "value": "value"},
+            on_activate=lambda r: self._edit_widget_option(sec, idx, r),
+            empty="No options",
+        )
+        self.need_refresh = True
+
+    def _edit_widget_option(self, sec, idx, row):
+        otype = row.get("type") or "text"
+        key = row["key"]
+        if otype == "enum":
+            opts = list(row.get("enum") or [])
+            if not opts:
+                opts = [""]
+            self.open_dropdown(row["label"], opts, row.get("value"),
+                               lambda v: self._apply_option(sec, idx, key, v))
+            return
+        if otype == "bool":
+            self._apply_option(sec, idx, key, not bool(row.get("value")))
+            return
+
+        def small_apply(raw):
+            v = raw.strip()
+            if otype == "int":
+                try:
+                    v = int(v)
+                except ValueError:
+                    self.model.status = "Not an integer"
+                    self.need_refresh = True
+                    return
+            else:
+                try:
+                    v = float(v)
+                except ValueError:
+                    self.model.status = "Not a number"
+                    self.need_refresh = True
+                    return
+            lo = row.get("min")
+            hi = row.get("max")
+            if lo is not None:
+                v = max(v, lo)
+            if hi is not None:
+                v = min(v, hi)
+            self._apply_option(sec, idx, key, v)
+
+        if otype in ("int", "num"):
+            self.ov = None
+            self.open_prompt(row["label"], str(row.get("value") or 0), "num",
+                             small_apply)
+            return
+        self.ov = None
+        self.open_prompt(row["label"], str(row.get("value") or ""), "text",
+                         lambda v: self._apply_option(sec, idx, key, v))
+
+    def _apply_option(self, sec, idx, key, value):
+        self.model.apply_widget_option(sec, idx, key, value)
+        self.model.status = f"{key} → {value}"
+        self.need_refresh = True
+        if self.ov and isinstance(self.ov, ListOverlay):
+            self.ov.rows = self.model.widget_options(sec, idx)
+            self.ov.sel = min(self.ov.sel, max(0, len(self.ov.rows) - 1))
+        else:
+            self.open_widget_options(sec, idx)
+
+    def _duplicate(self, sec, idx):
+        lst = self.model.layout[sec]
+        if not (0 <= idx < len(lst)):
+            return
+        name = display_name(self.model.catalog, entry_id(lst[idx]))
+        self.model.duplicate_widget(sec, idx)
+        self.lay_i = len(self.model.layout[sec]) - 1
+        self.model.status = "Duplicated " + name
+
+    def open_profiles(self):
+        self.pending_delete = None
+        self.ov = ListOverlay(
+            "PROFILES — Enter load · x delete · c save-as", self._profile_rows(),
+            key={"label": "label"},
+            on_activate=self._load_profile,
+            on_delete=self._delete_profile,
+            on_save=self._prompt_save_profile,
+            empty="No saved profiles",
+        )
+        self.need_refresh = True
+
+    def _profile_rows(self):
+        return [{"name": n, "label": n} for n in self.model.refresh_profiles()]
+
+    def _load_profile(self, row):
+        try:
+            self.model.load_profile(row["name"])
+        except Exception as e:
+            if str(e):
+                self.model.status = f"{e}"
+            else:
+                self.model.status = "Profile load failed"
+        self.ov = None
+        self.need_refresh = True
+
+    def _prompt_save_profile(self):
+        self.ov = None
+        self.open_prompt("Save profile as:", "", "text", self._do_save_profile)
+
+    def _do_save_profile(self, name):
+        if not name:
+            self.model.status = "Profile name required"
+            self.open_profiles()
+            self.need_refresh = True
+            return
+        try:
+            self.model.save_profile(name)
+            self.model.status = f"Profile {name} saved"
+        except Exception as e:
+            self.model.status = f"Save failed: {e}"
+        self.open_profiles()
+        self.need_refresh = True
+
+    def _delete_profile(self, row):
+        name = row["name"]
+        if self.pending_delete == name:
+            try:
+                self.model.delete_profile(name)
+                self.model.status = f"Profile {name} deleted"
+            except Exception as e:
+                self.model.status = f"Delete failed: {e}"
+            self.pending_delete = None
+            self.ov.rows = self._profile_rows()
+            self.ov.sel = min(self.ov.sel, max(0, len(self.ov.rows) - 1))
+        else:
+            self.pending_delete = name
+            self.model.status = f"Press x again to delete profile {name}"
+        self.need_refresh = True
+
+    def action_reset(self):
+        self.open_prompt("Reset bar to Omarchy defaults?", "", "confirm",
+                         lambda v: self._do_reset())
+
+    def _do_reset(self):
+        try:
+            self.model.reset_bar()
+        except Exception as e:
+            self.model.status = f"Reset failed: {e}"
         self.need_refresh = True
 
     def action_quit(self):
@@ -1081,6 +1400,22 @@ class BarEditorTUI:
         if self.prompt or self.ov:
             if self.ov:
                 self.ov.mouse(self.s, my, mx, bstate)
+            return
+
+        # drag-and-drop: press on a layout row, release over another row
+        # moves the widget there (over the same row is a plain click)
+        if bstate & curses.BUTTON1_PRESSED:
+            self.drag_sec, self.drag_idx = self._row_at(my, mx)
+            self.drag_oy, self.drag_ox = my, mx
+            return
+        if bstate & curses.BUTTON1_RELEASED:
+            if self.drag_sec is not None and self.drag_ox >= 0:
+                src = (self.drag_sec, self.drag_idx)
+                self.drag_sec, self.drag_idx = None, -1
+                dst = self._row_at(my, mx)
+                if dst[0] and dst != src:
+                    self._complete_drag(src, dst)
+                    return
             return
 
         st = self.settings_rect
@@ -1123,18 +1458,50 @@ class BarEditorTUI:
             self.lay_i = max(0, min(len(self.model.layout[sec]) - 1, self.lay_i))
         self.need_refresh = True
 
+    def _row_at(self, my, mx):
+        st = self.settings_rect
+        if st[0] <= my <= st[3] and st[1] <= mx <= st[2]:
+            return (None, -1)
+        for si, rects in enumerate(self.row_rects):
+            for kind, real, ry, lx, rx in rects:
+                if ry == my and lx <= mx <= rx:
+                    if kind == "add":
+                        return (SECTIONS[si], len(self.model.layout[SECTIONS[si]]))
+                    return (SECTIONS[si], real)
+        return (None, -1)
+
+    def _complete_drag(self, src, dst):
+        src_sec, src_idx = src
+        dst_sec, dst_idx = dst
+        if src_sec is None or dst_sec is None:
+            return
+        if src_sec == dst_sec and src_idx == dst_idx:
+            return
+        pos = self.model.drop_widget(src_sec, src_idx, dst_sec, dst_idx)
+        if pos is None:
+            return
+        self.sec_i = SECTIONS.index(dst_sec)
+        self.lay_i = pos
+        if self.sel_sec == src_sec and self.sel_idx == src_idx:
+            self.sel_sec, self.sel_idx = dst_sec, pos
+        name = display_name(self.model.catalog, entry_id(self.model.layout[dst_sec][pos]))
+        self.model.status = "Moved " + name
+        self.need_refresh = True
+
 
 class ListOverlay:
     """Generic searchable list overlay (add-widget, dropdown, plugins)."""
 
     def __init__(self, title, rows, on_activate=None, key=None, empty="No items",
-                 preselect=None, checkbox=False):
+                 preselect=None, checkbox=False, on_delete=None, on_save=None):
         self.title = title
         self.rows = rows
         self.on_activate = on_activate or (lambda r: None)
         self.fields = key or {"label": "label"}
         self.empty = empty
         self.checkbox = checkbox
+        self.on_delete = on_delete
+        self.on_save = on_save
         self.filter = ""
         self.sel = 0
         self.scroll = 0
@@ -1219,6 +1586,11 @@ class ListOverlay:
         elif ch in (10, ord("\n"), 13):
             if items and 0 <= self.sel < len(items):
                 self.on_activate(items[self.sel])
+        elif ch in (ord("x"), ord("X"), ord("d"), ord("D")) and self.on_delete:
+            if items and 0 <= self.sel < len(items):
+                self.on_delete(items[self.sel])
+        elif ch in (ord("c"), ord("C"), ord("s"), ord("S")) and self.on_save:
+            self.on_save()
         elif ch in (curses.KEY_UP, ord("k"), ord("K")):
             if self.sel > 0:
                 self.sel -= 1
@@ -1276,6 +1648,7 @@ def _main(stdscr):
         init_colors()
     curses.mousemask(
         curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED |
+        curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED |
         curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
 
     model = Model()

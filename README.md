@@ -36,6 +36,7 @@ omarchy bar put davidjm.bar-editor
 | `~/.config/omarchy/shell.json.bak-editor` | Backup created on every save |
 | `~/.config/omarchy/shell.toml` | `[bar]` colors, alpha, sizing |
 | `~/.config/omarchy/shell.toml.bak-editor` | Backup created on every save |
+| `~/.config/omarchy/bar-profiles/` | Saved profiles (`Ctrl+P`) |
 
 All writes go through `shell_io.py` (atomic replace, symlink-safe), never from
 the UI directly.
@@ -47,12 +48,18 @@ the UI directly.
 - Widget layout editing for the left / center / right sections:
   add, remove, reorder (up/down), and move between sections
 - Add-widget search overlay (filters the installed widget catalog)
+- Per-widget option editing (`e`/`Enter`): schema-driven settings for any
+  widget — dropdowns for enums, toggles for booleans, numeric/text prompts
+- Duplicate a widget (`c`)
 - `[bar]` styling in `shell.toml`: colors, background alpha, sizing,
   scale-with-font
 - Undo/redo (100-step), save/reload
-- Bar show/hide, plugin enable/disable
+- Bar show/hide, plugin enable/disable, reset bar to defaults
+- Bar profiles (`Ctrl+P`): save the current bar as a named profile, load or
+  delete saved ones
 - Mouse support: click rows to select, click a section to focus it, scroll to
-  browse long lists
+  browse long lists, and **drag-and-drop** a widget onto another row or into a
+  new section to move it
 - Select-and-move: press Space to grab a widget, then use `←/→` (or `h/l`)
   to move it into a different column and `↑/↓` (or `j/k`) to reorder it within
   its column; Space again to drop
@@ -64,12 +71,17 @@ the UI directly.
 | `Tab` | switch between the layout and settings panes |
 | `hjkl` / arrows | move cursor; ← at the left edge enters the settings pane, → returns to the layout |
 | `Space` | select a widget (marked with ▸); with a widget selected, `←/→` move it into the neighbouring column and `↑/↓` reorder it within its column |
-| `Enter` | edit the selected setting |
+| `Enter` | edit the selected setting, or edit the focused widget's options |
+| `e` | edit the focused widget's options |
 | `a` / `+` | add a widget to the focused section |
+| `c` | duplicate the focused widget |
 | `x` / `Delete` | remove the selected widget |
 | `-` / `=` | move the widget up / down in its section |
 | `[` / `]` | move the widget to the previous / next section |
 | `p` | plugin enable/disable |
+| `r` | reset the bar to defaults (confirm) |
+| `b` | toggle bar visibility |
+| `Ctrl+P` | profiles: `Enter` loads, `x` deletes (press twice), `c` saves as |
 | `Ctrl+S` | save (shell reloads automatically) |
 | `Ctrl+R` | reload from disk |
 | `Ctrl+Z` / `Ctrl+Y` | undo / redo |
