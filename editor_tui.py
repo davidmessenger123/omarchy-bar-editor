@@ -710,7 +710,7 @@ class BarEditorTUI:
     def draw_header(self):
         w = self.max_x
         title = " OMARCHY  BAR EDITOR "
-        hints = "  ←/→/↑/↓ move · a add · e opts · c dup · p plugins · ^P profiles "  # noqa: E501
+        hints = "  ←/→/↑/↓ move · a add · e opts · c dup · p plugins "  # noqa: E501
         self._put(0, 0, " " * w, 0)
         self._put(0, 1, title, curses.A_BOLD, PAIR.get("cyan", 0))
         pad = max(0, w - len(title) - 3 - len(hints))
@@ -870,7 +870,7 @@ class BarEditorTUI:
         self._put(self.max_y - 1, 1, "●", curses.A_BOLD, dotpair)
         self._put(self.max_y - 1, 3, m.status, 0,
                   PAIR.get("urgent" if m.dirty else "dim", 0))
-        hints = "Ctrl+S save · Ctrl+R reload · Ctrl+Z undo · Ctrl+Y redo · Esc quit"
+        hints = "Ctrl+S save · Ctrl+R reload · Ctrl+Z undo · Ctrl+Y redo · Ctrl+P profiles · Esc quit"
         if w - 1 - len(hints) > 25:
             self._put(self.max_y - 1, w - 1 - len(hints), hints, 0, PAIR.get("dim", 0))
 
