@@ -11,7 +11,7 @@ import qs.Ui
 BarWidget {
   id: root
 
-  readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "")
+  readonly property string pluginDir: decodeURIComponent(String(Qt.resolvedUrl(".")).replace(/^file:\/\//, ""))
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight

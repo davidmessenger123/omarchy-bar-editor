@@ -127,10 +127,13 @@ def write_bytes_atomic(path, data, mode=None):
 
     if mode is None:
         try:
-            existing = os.stat(path).st_mode & 0o7777
+            lst = os.lstat(path)
         except OSError:
-            existing = 0o600
-        mode = existing
+            mode = 0o600
+        else:
+            if not stat.S_ISREG(lst.st_mode):
+                raise SystemExit(f"refusing non-regular write target: {path}")
+            mode = lst.st_mode & 0o7777
     os.chmod(tmp, mode)
     os.replace(tmp, path)
 
@@ -168,6 +171,26 @@ def load_json(path):
     return obj if isinstance(obj, dict) else {}, True
 
 
+def split_inline_comment(s):
+    """Split 'key = "val"  # note' into (value, comment). '#' only counts
+    outside double-quoted strings and must be preceded by whitespace."""
+    in_str = False
+    escaped = False
+    for i, ch in enumerate(s):
+        if escaped:
+            escaped = False
+            continue
+        if in_str and ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if ch == "#" and not in_str and i > 0 and s[i - 1] in " \t":
+            return s[:i], s[i:]
+    return s, ""
+
+
 def load_toml_bar():
     """Parse the [bar] section values from shell.toml (mirrors the GTK app)."""
     values = {}
@@ -183,44 +206,102 @@ def load_toml_bar():
         if not line_str or line_str.startswith("#") or "=" not in line_str:
             continue
         key, _, val = line_str.partition("=")
+        value, _ = split_inline_comment(val)
         key = key.strip().replace("-", "_")
-        values[key] = val.strip().strip("'\"")
+        values[key] = value.strip().strip("'\"")
     return values, exists
 
 
+MANAGED_BAR_KEYS = (
+    ("background", "background", "#1a1b26"),
+    ("background_alpha", "background-alpha", "1.0"),
+    ("text", "text", "#c0caf5"),
+    ("active", "active", "#f7768e"),
+    ("scale_with_font", "scale-with-font", "true"),
+    ("size_horizontal", "size-horizontal", "26"),
+    ("size_vertical", "size-vertical", "28"),
+)
+
+
+def _toml_value(raw_value, default):
+    """Format a managed [bar] value as a TOML literal, preserving its type."""
+    v = str(raw_value).strip() if raw_value is not None else str(default)
+    if v.lower() in ("true", "false"):
+        return v.lower()
+    try:
+        float(v)
+        return v
+    except ValueError:
+        pass
+    return json.dumps(v, ensure_ascii=False)
+
+
+def _managed_bar_line(key, value):
+    return f"{key} = {_toml_value(value, '')}\n"
+
+
 def format_toml(values, original_content=""):
-    """Replace or append the [bar] block, preserving other sections."""
-    bar_block = (
-        "[bar]\n"
-        f'background       = "{values.get("background", "#1a1b26")}"\n'
-        f'background-alpha = {values.get("background_alpha", "1.0")}\n'
-        f'text             = "{values.get("text", "#c0caf5")}"\n'
-        f'active           = "{values.get("active", "#f7768e")}"\n'
-        f'scale-with-font  = {str(values.get("scale_with_font", "true")).lower()}\n'
-        f'size-horizontal  = {values.get("size_horizontal", "26")}\n'
-        f'size-vertical    = {values.get("size_vertical", "28")}\n'
-    )
-    if not original_content.strip():
-        return "# Omarchy Bar Editor managed [bar] overrides.\n" + bar_block
+    """Rewrite only the managed keys inside the existing [bar] section,
+    preserving every other key, comment, and their ordering. Appends a fresh
+    [bar] block when no section exists yet."""
+    values = values or {}
     lines = original_content.splitlines(keepends=True)
-    in_bar = False
+
     start_idx = -1
-    end_idx = -1
+    end_idx = len(lines)
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            sec = stripped[1:-1].strip()
-            if sec == "bar":
-                in_bar = True
-                start_idx = i
-            elif in_bar:
-                end_idx = i
-                break
-    if in_bar:
-        if end_idx == -1:
-            end_idx = len(lines)
-        return "".join(lines[:start_idx] + [bar_block] + lines[end_idx:])
-    return original_content.rstrip() + "\n\n" + bar_block
+        if not (stripped.startswith("[") and stripped.endswith("]")):
+            continue
+        sec = stripped[1:-1].strip()
+        if sec == "bar":
+            start_idx = i
+        elif start_idx >= 0:
+            end_idx = i
+            break
+
+    if start_idx == -1:
+        block = "[bar]\n" + "".join(
+            _managed_bar_line(key, values.get(ukey, default))
+            for ukey, key, default in MANAGED_BAR_KEYS
+        )
+        if not original_content.strip():
+            return "# Omarchy Bar Editor managed [bar] overrides.\n" + block
+        return original_content.rstrip() + "\n\n" + block
+
+    key_to_ukey = {key: ukey for ukey, key, _ in MANAGED_BAR_KEYS}
+    defaults = {ukey: default for ukey, _, default in MANAGED_BAR_KEYS}
+    out = []
+    seen = set()
+    for line in lines[start_idx:end_idx]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            out.append(line)
+            continue
+        raw_key, _, val_part = stripped.partition("=")
+        key = raw_key.strip()
+        ukey = key_to_ukey.get(key.replace("_", "-"))
+        if ukey is None:
+            out.append(line)
+            continue
+        _, comment = split_inline_comment(val_part)
+        new_val = _toml_value(values.get(ukey), defaults[ukey])
+        indent = raw_key[: len(raw_key) - len(raw_key.lstrip())]
+        lead = raw_key[len(indent) + len(key):]
+        vgap = val_part[: len(val_part) - len(val_part.lstrip())]
+        suffix = f" {comment.strip()}" if comment.strip() else ""
+        out.append(f"{indent}{key}{lead}={vgap}{new_val}{suffix}\n")
+        seen.add(ukey)
+
+    missing = [
+        _managed_bar_line(key, values.get(ukey, defaults[ukey]))
+        for ukey, key, _ in MANAGED_BAR_KEYS
+        if ukey not in seen
+    ]
+    if missing:
+        out.append("".join(missing))
+
+    return "".join(lines[:start_idx] + out + lines[end_idx:])
 
 
 def cmd_read():
@@ -295,22 +376,25 @@ def safe_profile_name(name):
 
 def list_profiles():
     verify_parent_dir(PROFILES_DIR)
-    if not os.path.isdir(PROFILES_DIR):
-        return []
     names = []
     try:
-        for entry in os.listdir(PROFILES_DIR):
+        dfd = os.open(PROFILES_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        if e.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EACCES):
+            return []
+        raise SystemExit(f"cannot open profiles dir: {e.strerror}")
+    try:
+        for entry in os.listdir(dfd):
             if not entry.endswith(".json"):
                 continue
-            p = os.path.join(PROFILES_DIR, entry)
             try:
-                st = os.lstat(p)
+                st = os.stat(entry, dir_fd=dfd, follow_symlinks=False)
             except OSError:
                 continue
             if stat.S_ISREG(st.st_mode):
                 names.append(entry[:-5])
-    except OSError:
-        return []
+    finally:
+        os.close(dfd)
     return sorted(names)
 
 
@@ -330,8 +414,8 @@ def cmd_profiles(args):
         payload = read_stdin_json()
         if not isinstance(payload, dict):
             raise SystemExit("profile must be an object")
-        verify_parent_dir(path)
         os.makedirs(PROFILES_DIR, exist_ok=True)
+        verify_parent_dir(path)
         data = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
         write_bytes_atomic(path, data.encode("utf-8"))
         print(json.dumps({"ok": True}, ensure_ascii=False))
@@ -363,6 +447,7 @@ def main():
     cwd = os.getcwd()
     os.chdir("/")  # never run relative to a caller-controlled directory
     root = os.path.abspath(CONFIG_ROOT)
+    os.makedirs(root, exist_ok=True)  # fresh profile save on an uninitialized config
     verify_parent_dir(os.path.join(root, "x"))
     os.chdir(cwd)
 

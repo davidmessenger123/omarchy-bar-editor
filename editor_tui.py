@@ -31,6 +31,8 @@ Keys:
     Esc               close overlay / quit (after confirming unsaved work)
 """
 
+import collections
+import copy
 import curses
 import json
 import os
@@ -71,7 +73,8 @@ PAIR_ORDER = ["red", "green", "yellow", "blue", "magenta", "cyan", "white", "dim
 def cat_pair(category):
     name = CAT_COLORS.get((category or "").lower())
     if name is None:
-        name = CAT_STD[hash(category or "") % len(CAT_STD)]
+        total = sum((category or "").encode("utf-8", "replace"))
+        name = CAT_STD[total % len(CAT_STD)]
     return PAIR.get(name, 0)
 
 
@@ -260,15 +263,16 @@ class Model:
         self.layout = {sec: [] for sec in SECTIONS}
 
         self._profiles = []
+        self._meta = {}
 
-        self.undo = []
-        self.redo = []
         self.undo_limit = 100
+        self.undo = collections.deque(maxlen=self.undo_limit)
+        self.redo = []
 
     # -- snapshots ---------------------------------------------------------
     def snapshot(self):
         return {
-            k: (json.loads(json.dumps(v)) if isinstance(v, (dict, list)) else v)
+            k: (copy.deepcopy(v) if isinstance(v, (dict, list)) else v)
             for k, v in self.__dict__.items()
             if k in (
                 "cfg", "toml", "position", "transparent", "anchor", "host",
@@ -284,8 +288,6 @@ class Model:
     def push_history(self):
         self.undo.append(self.snapshot())
         self.redo.clear()
-        if len(self.undo) > self.undo_limit:
-            self.undo.pop(0)
 
     def undo_step(self):
         if not self.undo:
@@ -304,6 +306,13 @@ class Model:
         return True
 
     # -- load / save -------------------------------------------------------
+    def meta(self, wid):
+        hit = self._meta.get(wid)
+        if hit is None:
+            hit = (display_name(self.catalog, wid), category_of(self.catalog, wid))
+            self._meta[wid] = hit
+        return hit
+
     def load(self):
         data = io_read()
         self.cfg = ensure_cfg(data.get("cfg") or {})
@@ -313,8 +322,11 @@ class Model:
             self.states = load_plugin_states()
         except Exception:
             self.catalog, self.states = {}, {}
-        self.refresh_profiles()
+        self._meta = {}
+        self._profiles = data.get("profiles") or []
         self.apply_from_cfg()
+        self.undo.clear()
+        self.redo.clear()
 
     def apply_from_cfg(self):
         bar = self.cfg.get("bar") or {}
@@ -554,6 +566,8 @@ class Model:
         self.cfg = ensure_cfg(data.get("shell") or {})
         self.toml = {"values": (data.get("toml") or {}).get("values") or {},
                      "exists": True}
+        self.undo.clear()
+        self.redo.clear()
         self.apply_from_cfg()
         self.mark_dirty()
         self.status = "Loaded profile — save to apply"
@@ -816,10 +830,14 @@ class BarEditorTUI:
     def draw_section(self, sec, si, top, left, right, height):
         lst = self.model.layout[sec]
         hay = self.search.lower()
-        shown = [
-            i for i, e in enumerate(lst) if not hay or
-            hay in (str(entry_id(e)) + " " + display_name(self.model.catalog, entry_id(e))).lower()
-        ]
+        if hay:
+            def row_key(e):
+                ident = entry_id(e)
+                name, cat = self.model.meta(ident)
+                return (str(ident) + " " + name + " " + cat).lower()
+            shown = [i for i, e in enumerate(lst) if hay in row_key(e)]
+        else:
+            shown = list(range(len(lst)))
 
         scroll = self.lay_scroll[sec]
         if self.side == "layout" and si == self.sec_i and not self.ov:
@@ -848,7 +866,7 @@ class BarEditorTUI:
                         and self.lay_i == real and not self.ov)
             carried = (self.sel_sec == sec and self.sel_idx == real)
             usable = max(1, right - left + 1)
-            name = display_name(self.model.catalog, ident)
+            name, cat = self.model.meta(ident)
             mark = "▸" if carried else " "
             line = mark + " " + name
             if len(line) > usable:
@@ -858,7 +876,7 @@ class BarEditorTUI:
             elif selected:
                 self._put(y, left, line, curses.A_REVERSE)
             else:
-                self._put(y, left, line, 0, cat_pair(category_of(self.model.catalog, ident)))
+                self._put(y, left, line, 0, cat_pair(cat))
             rects.append(("row", real, y, left, right))
         self.row_rects[si] = rects
 
@@ -1134,6 +1152,10 @@ class BarEditorTUI:
                         return
                     if attr == "alpha":
                         val = max(0, min(100, val))
+                    elif attr in ("screensaver", "lock"):
+                        val = max(0, val)
+                    elif attr in ("size_h", "size_v"):
+                        val = max(1, val)
                 cur = getattr(m, attr)
                 if val != cur:
                     m.push_history()
@@ -1531,6 +1553,13 @@ class ListOverlay:
         parts = [str(r.get(k)) for k in (self.fields or {}).values() if r.get(k) is not None]
         return " · ".join(parts)
 
+    @staticmethod
+    def _safe_add(s, y, x, text, w, attr=0):
+        try:
+            s.addnstr(y, x, text, w, attr)
+        except curses.error:
+            pass
+
     def draw(self, s):
         h, w = s.getmaxyx()
         ph = max(6, min(18, h - 6))
@@ -1541,9 +1570,9 @@ class ListOverlay:
         bot = top + ph - 1
 
         # body
-        s.addstr(top, left, "┌" + "─" * (pw - 2) + "┐")
-        s.addnstr(top + 1, left, f"│ {self.title[: pw - 4].ljust(pw - 4)} │", w, 0)
-        s.addnstr(top + 2, left, f"│ {('Search: ' + self.filter + '▏').ljust(pw - 4)[: pw - 4]} │", w, 0)
+        self._safe_add(s, top, left, "┌" + "─" * (pw - 2) + "┐", w, 0)
+        self._safe_add(s, top + 1, left, f"│ {self.title[: pw - 4].ljust(pw - 4)} │", w, 0)
+        self._safe_add(s, top + 2, left, f"│ {('Search: ' + self.filter + '▏').ljust(pw - 4)[: pw - 4]} │", w, 0)
 
         items = self.filtered()
         body_h = ph - 4
@@ -1570,8 +1599,8 @@ class ListOverlay:
             except curses.error:
                 pass
         if not items:
-            s.addnstr(top + 3, left, f"│ {self.empty}".ljust(pw - 1) + "│", w, 0)
-        s.addnstr(bot, left, "└" + "─" * (pw - 2) + "┘", w, 0)
+            self._safe_add(s, top + 3, left, f"│ {self.empty}".ljust(pw - 1) + "│", w, 0)
+        self._safe_add(s, bot, left, "└" + "─" * (pw - 2) + "┘", w, 0)
         s.refresh()
 
     def key(self, s, ch):
