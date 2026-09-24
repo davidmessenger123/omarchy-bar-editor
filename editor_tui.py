@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """
 Omarchy Bar Editor — terminal UI.
 
@@ -31,17 +31,39 @@ Keys:
     Esc               close overlay / quit (after confirming unsaved work)
 """
 
-import collections
+import contextlib
 import copy
 import curses
+import importlib.util
+import io
 import json
+import math
 import os
+import re
+import selectors
+import signal
+import stat
 import subprocess
 import sys
 import termios
+import time
+from collections import deque
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 SHELL_IO = os.path.join(PLUGIN_DIR, "shell_io.py")
+OMARCHY_PATH = "/usr/bin/omarchy"
+CATALOG_PATH = "/usr/bin/omarchy-plugin-catalog"
+
+# Prefer in-process shell_io (same security boundary, no subprocess per call).
+_shell_io = None
+try:
+    _spec = importlib.util.spec_from_file_location("omarchy_bar_editor_shell_io", SHELL_IO)
+    if _spec and _spec.loader:
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        _shell_io = _mod
+except Exception:
+    _shell_io = None
 
 SECTIONS = ["left", "center", "right"]
 SECTION_LABELS = {"left": "Left", "center": "Center", "right": "Right"}
@@ -68,6 +90,7 @@ CAT_STD = ["red", "green", "yellow", "blue", "magenta", "cyan", "white"]
 # named color pairs (initialized in _main)
 PAIR = {}
 PAIR_ORDER = ["red", "green", "yellow", "blue", "magenta", "cyan", "white", "dim"]
+MAX_PROMPT_CHARS = 4096
 
 
 def cat_pair(category):
@@ -82,69 +105,353 @@ def cat_pair(category):
 # config / catalog I/O
 # ---------------------------------------------------------------------------
 
-def run(cmd, payload=None):
+MAX_COMMAND_OUTPUT = 2 * 1024 * 1024
+MAX_ERROR_OUTPUT = 64 * 1024
+
+
+def _reject_json_constant(value):
+    raise ValueError("invalid JSON constant")
+
+
+def _json_load(value):
+    return json.loads(value, parse_constant=_reject_json_constant)
+
+
+def _trusted_executable(value):
+    if not isinstance(value, str) or not value or len(value) > 4096 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return None
     try:
-        p = subprocess.run(
-            cmd,
-            input=json.dumps(payload, ensure_ascii=False) if payload is not None else None,
-            capture_output=True,
-            text=True,
-            timeout=30,
+        path = os.path.realpath(value)
+        info = os.stat(path)
+    except OSError:
+        return None
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+            or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) & 0o022):
+        return None
+    if not os.access(path, os.X_OK):
+        return None
+    return path
+
+
+def _command_environment():
+    env = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": os.environ.get("HOME", ""),
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+    for name in (
+        "USER", "LOGNAME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+        "XDG_STATE_HOME", "DISPLAY", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP", "TERM",
+    ):
+        value = os.environ.get(name, "")
+        if value:
+            env[name] = value
+    return {key: value for key, value in env.items() if value and len(value) <= 4096 and not any(ord(char) < 32 or ord(char) == 127 for char in value)}
+
+
+def _kill_process(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def run(cmd, payload=None, timeout=30):
+    if not isinstance(cmd, (list, tuple)) or not cmd or len(cmd) > 32:
+        return 1, "", "invalid command"
+    executable = _trusted_executable(cmd[0])
+    if executable is None:
+        return 1, "", "untrusted command"
+    command = [executable]
+    for value in cmd[1:]:
+        if (not isinstance(value, str) or not value or len(value) > 4096
+                or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+            return 1, "", "invalid command argument"
+        command.append(value)
+    encoded = None
+    if payload is not None:
+        try:
+            encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            return 1, "", str(exc)
+        if len(encoded) > MAX_COMMAND_OUTPUT:
+            return 1, "", "input too large"
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE if encoded is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            cwd="/",
+            env=_command_environment(),
         )
-    except (OSError, subprocess.SubprocessError) as e:
-        return 1, "", str(e)
-    return p.returncode, p.stdout, p.stderr
+    except OSError as exc:
+        return 1, "", str(exc)
+    try:
+        timeout = max(1, min(120, float(timeout)))
+    except (TypeError, ValueError, OverflowError):
+        return 1, "", "invalid timeout"
+    selector = selectors.DefaultSelector()
+    stdout = bytearray()
+    stderr = bytearray()
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ, stdout)
+        selector.register(process.stderr, selectors.EVENT_READ, stderr)
+        input_view = memoryview(encoded) if encoded is not None else None
+        input_offset = 0
+        if input_view is not None:
+            os.set_blocking(process.stdin.fileno(), False)
+            selector.register(process.stdin, selectors.EVENT_WRITE, "input")
+        deadline = time.monotonic() + max(1, min(120, float(timeout)))
+        overflow = False
+        timed_out = False
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                _kill_process(process)
+                process.wait()
+                break
+            for key, _ in selector.select(min(0.25, remaining)):
+                if key.data == "input":
+                    try:
+                        count = os.write(key.fileobj.fileno(), input_view[input_offset:])
+                        input_offset += count
+                        if input_offset >= len(input_view):
+                            selector.unregister(key.fileobj)
+                            key.fileobj.close()
+                    except (BlockingIOError, InterruptedError):
+                        continue
+                    except OSError:
+                        selector.unregister(key.fileobj)
+                        try:
+                            key.fileobj.close()
+                        except OSError:
+                            pass
+                    continue
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                target = key.data
+                limit = MAX_COMMAND_OUTPUT if target is stdout else MAX_ERROR_OUTPUT
+                if len(target) < limit:
+                    target.extend(chunk[:limit - len(target)])
+                if len(target) >= limit:
+                    overflow = True
+                    _kill_process(process)
+                    break
+            if overflow:
+                process.wait()
+                break
+        if timed_out:
+            return 124, stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace")
+        if overflow:
+            return 125, stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace")
+    except Exception:
+        _kill_process(process)
+        try:
+            process.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return 1, stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace")
+    finally:
+        selector.close()
+        for stream in (process.stdout, process.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        if encoded is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        _kill_process(process)
+        process.wait()
+    return process.returncode, stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace")
+
+
+def _invoke_shell_io(args, payload=None):
+    """Call shell_io cmd_* in-process; fall back to subprocess if import failed."""
+    if _shell_io is None:
+        return run(["/usr/bin/python3", SHELL_IO, *args], payload)
+
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    old_stdin = sys.stdin
+    cwd = os.getcwd()
+    try:
+        if payload is not None:
+            sys.stdin = io.StringIO(json.dumps(payload, ensure_ascii=False, allow_nan=False))
+        # Mirror shell_io.main() preflight so the security boundary still runs.
+        os.chdir("/")
+        root = os.path.abspath(_shell_io.CONFIG_ROOT)
+        _shell_io.verify_parent_dir(os.path.join(root, "x"), create=True)
+        os.chdir(cwd)
+
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+            cmd = args[0]
+            if cmd == "read":
+                _shell_io.cmd_read()
+            elif cmd == "write":
+                _shell_io.cmd_write()
+            elif cmd == "profiles":
+                _shell_io.cmd_profiles(args[1:])
+            else:
+                raise SystemExit(f"unknown command: {cmd}")
+        output = out_buf.getvalue()
+        if len(output) > MAX_COMMAND_OUTPUT:
+            raise RuntimeError("shell_io output is too large")
+        return 0, output, err_buf.getvalue()
+    except SystemExit as e:
+        code = e.code
+        if code is None or code == 0:
+            output = out_buf.getvalue()
+            if len(output) > MAX_COMMAND_OUTPUT:
+                raise RuntimeError("shell_io output is too large")
+            return 0, output, err_buf.getvalue()
+        if isinstance(code, int):
+            return code, out_buf.getvalue(), err_buf.getvalue() or str(code)
+        return 1, out_buf.getvalue(), str(code)
+    except Exception as e:
+        return 1, out_buf.getvalue(), str(e)
+    finally:
+        sys.stdin = old_stdin
+        try:
+            os.chdir(cwd)
+        except OSError:
+            pass
 
 
 def io_read():
-    rc, out, err = run([sys.executable, SHELL_IO, "read"])
-    if rc != 0 or not out:
+    rc, out, err = _invoke_shell_io(["read"])
+    if rc != 0 or not out or len(out) > MAX_COMMAND_OUTPUT:
         raise RuntimeError(err.strip() or "shell_io read failed")
-    return json.loads(out)
+    try:
+        data = _json_load(out)
+    except (json.JSONDecodeError, TypeError, RecursionError, ValueError) as exc:
+        raise RuntimeError("shell_io returned invalid JSON") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("shell_io returned invalid data")
+    return data
 
 
-def io_write(shell, toml_values):
+def io_write(shell, toml_values, base=None):
     payload = {}
     if shell is not None:
+        if not isinstance(base, dict):
+            raise RuntimeError("base shell configuration is missing")
         payload["shell"] = shell
+        payload["base"] = base
     if toml_values is not None:
         payload["toml"] = {"values": toml_values}
-    rc, out, err = run([sys.executable, SHELL_IO, "write"], payload)
+    try:
+        if len(json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")) > MAX_COMMAND_OUTPUT:
+            raise RuntimeError("configuration payload is too large")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("configuration payload is not serializable") from exc
+    rc, out, err = _invoke_shell_io(["write"], payload)
     if rc != 0:
         raise RuntimeError(err.strip() or "shell_io write failed")
+    if shell is None:
+        return None
+    try:
+        result = json.loads(out)
+    except (json.JSONDecodeError, TypeError, RecursionError, ValueError) as exc:
+        raise RuntimeError("shell_io write returned invalid JSON") from exc
+    if not isinstance(result, dict) or not isinstance(result.get("shell"), dict):
+        raise RuntimeError("shell_io write did not return shell configuration")
+    return result["shell"]
+
+
+def _valid_id(value):
+    text = str(value or "")
+    return (bool(text) and len(text) <= 128 and text[0].isascii() and text[0].isalnum()
+            and text not in ("constructor", "prototype", "__proto__")
+            and all((char.isascii() and (char.isalnum() or char in "._-")) for char in text))
+
+
+def _safe_text(value, limit=256):
+    if not isinstance(value, str):
+        return ""
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return ""
+    return value[:limit]
+
+
+def _valid_color(value):
+    text = str(value or "")
+    return len(text) == 7 and text[0] == "#" and all(
+        char in "0123456789abcdefABCDEF" for char in text[1:]
+    )
+
+
+def _valid_profile_name(value):
+    text = str(value or "").strip()
+    return bool(text) and len(text) <= 64 and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,63}", text))
 
 
 def load_catalog():
-    rc, out, err = run(["omarchy-plugin-catalog"])
-    if rc != 0 or not out:
-        return {}
+    rc, out, err = run([CATALOG_PATH], timeout=10)
+    if rc != 0 or not out or len(out) > MAX_COMMAND_OUTPUT:
+        return None
     try:
-        entries = json.loads(out)
-    except json.JSONDecodeError:
-        return {}
-    return {e["id"]: e for e in entries if e and e.get("id")}
+        entries = _json_load(out)
+    except (json.JSONDecodeError, TypeError, RecursionError, ValueError):
+        return None
+    if not isinstance(entries, list) or len(entries) > 10000:
+        return None
+    result = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not _valid_id(entry.get("id")):
+            continue
+        item = dict(entry)
+        item["id"] = str(entry["id"])
+        kinds = item.get("kinds")
+        item["kinds"] = [str(kind)[:64] for kind in kinds[:32]] if isinstance(kinds, list) else []
+        result[item["id"]] = item
+    return result
 
 
 def load_plugin_states():
-    rc, out, err = run(["omarchy", "plugin", "list", "--json"])
-    if rc != 0 or not out:
-        return {}
+    rc, out, err = run([OMARCHY_PATH, "plugin", "list", "--json"], timeout=10)
+    if rc != 0 or not out or len(out) > MAX_COMMAND_OUTPUT:
+        return None
     try:
-        entries = json.loads(out)
-    except json.JSONDecodeError:
-        return {}
-    return {e["id"]: e["enabled"] for e in entries if e and e.get("enabled") is not None}
+        entries = _json_load(out)
+    except (json.JSONDecodeError, TypeError, RecursionError, ValueError):
+        return None
+    if not isinstance(entries, list) or len(entries) > 10000:
+        return None
+    result = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not _valid_id(entry.get("id")):
+            continue
+        enabled = entry.get("enabled")
+        result[str(entry["id"])] = enabled if isinstance(enabled, bool) else None
+    return result
 
 
 def load_profiles():
-    rc, out, err = run([sys.executable, SHELL_IO, "profiles", "list"])
-    if rc != 0 or not out:
-        return []
+    rc, out, err = _invoke_shell_io(["profiles", "list"])
+    if rc != 0 or not out or len(out) > MAX_COMMAND_OUTPUT:
+        return None
     try:
-        names = json.loads(out)
-    except json.JSONDecodeError:
-        return []
-    return [n for n in names if isinstance(n, str)]
+        names = _json_load(out)
+    except (json.JSONDecodeError, TypeError, RecursionError, ValueError):
+        return None
+    if not isinstance(names, list):
+        return None
+    return [str(name) for name in names if isinstance(name, str) and len(name) <= 64]
 
 
 # ---------------------------------------------------------------------------
@@ -154,8 +461,14 @@ def load_profiles():
 def ensure_cfg(cfg):
     if not isinstance(cfg, dict):
         cfg = {}
-    cfg.setdefault("bar", {})
-    layout = cfg["bar"].setdefault("layout", {})
+    bar = cfg.get("bar")
+    if not isinstance(bar, dict):
+        bar = {}
+        cfg["bar"] = bar
+    layout = bar.get("layout")
+    if not isinstance(layout, dict):
+        layout = {}
+        bar["layout"] = layout
     for sec in SECTIONS:
         if not isinstance(layout.get(sec), list):
             layout[sec] = []
@@ -164,55 +477,65 @@ def ensure_cfg(cfg):
 
 
 def widget_info(catalog, wid):
-    return (catalog or {}).get(wid, {}) or {}
+    if not isinstance(catalog, dict) or not isinstance(wid, str):
+        return {}
+    value = catalog.get(wid, {})
+    return value if isinstance(value, dict) else {}
 
 
 def display_name(catalog, wid):
     info = widget_info(catalog, wid)
-    bw = info.get("barWidget") or {}
-    return bw.get("displayName") or info.get("name") or wid
+    bw = info.get("barWidget") if isinstance(info.get("barWidget"), dict) else {}
+    value = bw.get("displayName") or info.get("name") or wid
+    return str(value)[:256]
 
 
 def category_of(catalog, wid):
-    bw = widget_info(catalog, wid).get("barWidget") or {}
-    return bw.get("category") or "Utilities"
+    info = widget_info(catalog, wid)
+    bw = info.get("barWidget") if isinstance(info.get("barWidget"), dict) else {}
+    return str(bw.get("category") or "Utilities")[:64]
 
 
 def allow_multiple(catalog, wid):
-    bw = widget_info(catalog, wid).get("barWidget") or {}
+    info = widget_info(catalog, wid)
+    bw = info.get("barWidget") if isinstance(info.get("barWidget"), dict) else {}
     v = bw.get("allowMultiple")
-    return True if v is None else bool(v)
+    return True if v is None else v is True
 
 
 def is_bar_widget(info):
-    return bool(info) and "bar-widget" in (info.get("kinds") or [])
+    return isinstance(info, dict) and "bar-widget" in (info.get("kinds") or [])
 
 
 def hosts(catalog):
     result = ["omarchy.bar"]
     ids = []
     for wid, info in (catalog or {}).items():
-        if wid == "omarchy.bar":
+        if wid == "omarchy.bar" or not _valid_id(wid) or not isinstance(info, dict):
             continue
-        if "bar" not in (info.get("kinds") or []):
+        kinds = info.get("kinds") if isinstance(info.get("kinds"), list) else []
+        if "bar" not in kinds or not isinstance(info.get("barPath"), str):
             continue
-        if not info.get("barPath"):
+        if len(info["barPath"]) > 4096 or "\x00" in info["barPath"]:
             continue
         ids.append(wid)
     return result + sorted(ids)
 
 
 def entry_id(entry):
-    return entry.get("id") if isinstance(entry, dict) else entry
+    value = entry.get("id") if isinstance(entry, dict) else entry
+    return value if _valid_id(value) else ""
 
 
 def _num_str(values, key, default):
-    v = values.get(key)
-    if v is None:
+    if not isinstance(values, dict):
         return default
-    if isinstance(v, bool):
-        return str(v).lower()
-    return str(v)
+    value = values.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)[:256]
 
 
 def schema_type(field, value=None):
@@ -241,6 +564,7 @@ class Model:
         self.catalog = {}
         self.states = {}
         self.cfg = {}
+        self.disk_cfg = {}
         self.toml = {}
         self.dirty = False
         self.status = ""
@@ -266,20 +590,23 @@ class Model:
         self._meta = {}
 
         self.undo_limit = 100
-        self.undo = collections.deque(maxlen=self.undo_limit)
-        self.redo = []
+        self.undo = deque(maxlen=self.undo_limit)
+        self.redo = deque(maxlen=self.undo_limit)
 
     # -- snapshots ---------------------------------------------------------
     def snapshot(self):
-        return {
-            k: (copy.deepcopy(v) if isinstance(v, (dict, list)) else v)
-            for k, v in self.__dict__.items()
-            if k in (
-                "cfg", "toml", "position", "transparent", "anchor", "host",
-                "font_family", "screensaver", "lock", "bg", "text_col",
-                "active", "alpha", "size_h", "size_v", "scale_font", "layout",
-            )
-        }
+        snap = {}
+        for k in (
+            "cfg", "disk_cfg", "toml", "position", "transparent", "anchor", "host",
+            "font_family", "screensaver", "lock", "bg", "text_col",
+            "active", "alpha", "size_h", "size_v", "scale_font", "layout",
+        ):
+            v = getattr(self, k)
+            if k in ("cfg", "disk_cfg", "layout", "toml"):
+                snap[k] = copy.deepcopy(v)
+            else:
+                snap[k] = v
+        return snap
 
     def restore(self, snap):
         for k, v in snap.items():
@@ -314,126 +641,222 @@ class Model:
         return hit
 
     def load(self):
-        data = io_read()
-        self.cfg = ensure_cfg(data.get("cfg") or {})
-        self.toml = dict(data.get("toml") or {})
+        old = self.snapshot()
+        old_catalog = copy.deepcopy(self.catalog)
+        old_states = dict(self.states)
+        old_profiles = list(self._profiles)
+        old_meta = dict(self._meta)
         try:
-            self.catalog = load_catalog()
-            self.states = load_plugin_states()
+            data = io_read()
+            raw_cfg = data.get("cfg")
+            if not isinstance(raw_cfg, dict):
+                raise RuntimeError("configuration is not an object")
+            raw_toml = data.get("toml")
+            cfg = ensure_cfg(copy.deepcopy(raw_cfg))
+            toml = copy.deepcopy(raw_toml) if isinstance(raw_toml, dict) else {}
+            catalog = load_catalog()
+            states = load_plugin_states()
+            profiles = data.get("profiles")
+            if not isinstance(profiles, list):
+                profiles = load_profiles()
+            if profiles is None:
+                profiles = old_profiles
+            profiles = [str(n)[:64] for n in profiles if isinstance(n, str) and len(n) <= 64]
+            loaded = dict(old)
+            loaded["cfg"] = cfg
+            loaded["disk_cfg"] = copy.deepcopy(raw_cfg)
+            loaded["toml"] = toml
+            self.restore(loaded)
+            if catalog is not None:
+                self.catalog = catalog
+            if states is not None:
+                self.states = states
+            self._profiles = profiles
+            self.apply_from_cfg()
+            self.undo.clear()
+            self.redo.clear()
+            self._meta = {}
         except Exception:
-            self.catalog, self.states = {}, {}
-        self._meta = {}
-        self._profiles = data.get("profiles") or []
-        self.apply_from_cfg()
-        self.undo.clear()
-        self.redo.clear()
+            self.restore(old)
+            self.catalog = old_catalog
+            self.states = old_states
+            self._profiles = old_profiles
+            self._meta = old_meta
+            raise
 
     def apply_from_cfg(self):
-        bar = self.cfg.get("bar") or {}
-        self.position = bar.get("position") or "top"
+        bar = self.cfg.get("bar") if isinstance(self.cfg.get("bar"), dict) else {}
+        position = bar.get("position")
+        self.position = position if position in POSITIONS else "top"
         self.transparent = bar.get("transparent") is True
-        self.anchor = bar.get("centerAnchor") or ""
-        self.host = bar.get("host") or "omarchy.bar"
-        self.font_family = bar.get("fontFamily") or ""
+        self.anchor = str(bar.get("centerAnchor") or "")[:256]
+        host = bar.get("host")
+        self.host = str(host)[:128] if isinstance(host, str) and host else "omarchy.bar"
+        font = bar.get("fontFamily")
+        self.font_family = str(font)[:256] if isinstance(font, str) else ""
         self.scale_font = bar.get("scaleWithFont") is not False
 
-        idle = self.cfg.get("idle") or {}
-        self.screensaver = idle.get("screensaver") or 0
-        self.lock = idle.get("lock") or 0
+        idle = self.cfg.get("idle") if isinstance(self.cfg.get("idle"), dict) else {}
+        try:
+            self.screensaver = max(0, min(86400, int(idle.get("screensaver", 0) or 0)))
+        except (TypeError, ValueError):
+            self.screensaver = 0
+        try:
+            self.lock = max(0, min(86400, int(idle.get("lock", 0) or 0)))
+        except (TypeError, ValueError):
+            self.lock = 0
 
-        tv = self.toml.get("values") or {}
+        tv = self.toml.get("values") if isinstance(self.toml.get("values"), dict) else {}
         self.bg = _num_str(tv, "background", DEFAULT_TOML["background"])
         self.text_col = _num_str(tv, "text", DEFAULT_TOML["text"])
         self.active = _num_str(tv, "active", DEFAULT_TOML["active"])
         try:
-            self.alpha = int(float(tv.get("background_alpha", 1.0)) * 100)
+            alpha = float(tv.get("background_alpha", 1.0))
+            if not math.isfinite(alpha):
+                raise ValueError
+            self.alpha = int(max(0.0, min(1.0, alpha)) * 100)
         except (TypeError, ValueError):
             self.alpha = 100
-        self.alpha = max(0, min(100, self.alpha))
         try:
-            self.size_h = int(tv.get("size_horizontal", 26))
-            self.size_v = int(tv.get("size_vertical", 28))
+            self.size_h = max(1, min(1000, int(tv.get("size_horizontal", 26))))
         except (TypeError, ValueError):
-            self.size_h, self.size_v = 26, 28
+            self.size_h = 26
+        try:
+            self.size_v = max(1, min(1000, int(tv.get("size_vertical", 28))))
+        except (TypeError, ValueError):
+            self.size_v = 28
         sf = _num_str(tv, "scale_with_font", "true")
-        self.scale_font = str(sf).strip().lower() != "false"
+        self.scale_font = str(sf).strip().lower() not in ("false", "0", "no", "off")
 
+        layout = bar.get("layout") if isinstance(bar.get("layout"), dict) else {}
+        count = 0
         for sec in SECTIONS:
-            raw = (bar.get("layout") or {}).get(sec) or []
-            self.layout[sec] = [e if isinstance(e, dict) else {"id": e} for e in raw]
-
+            raw = layout.get(sec) if isinstance(layout.get(sec), list) else []
+            self.layout[sec] = []
+            for entry in raw:
+                if count >= 1000:
+                    break
+                if isinstance(entry, dict):
+                    item = copy.deepcopy(entry)
+                    wid = entry_id(item)
+                else:
+                    wid = entry_id(entry)
+                    item = {"id": wid}
+                if wid:
+                    self.layout[sec].append(item)
+                    count += 1
         self.dirty = False
         self.status = "Ready"
 
     def gather_cfg(self):
-        cfg = ensure_cfg(self.cfg)
+        cfg = ensure_cfg(copy.deepcopy(self.cfg))
         bar = cfg["bar"]
         layout = bar.setdefault("layout", {})
         for sec in SECTIONS:
-            layout[sec] = [dict(e) if isinstance(e, dict) else {"id": e} for e in self.layout[sec]]
+            entries = []
+            for entry in self.layout.get(sec, []):
+                if not isinstance(entry, dict):
+                    entry = {"id": entry}
+                if not _valid_id(entry.get("id")):
+                    continue
+                entries.append(copy.deepcopy(entry))
+            layout[sec] = entries[:1000]
 
-        def put(dst, val, default):
-            if val != default:
-                bar[dst] = val
+        def put(dst, value, default):
+            value = _safe_text(value, 256) if isinstance(value, str) else value
+            if value != default:
+                bar[dst] = value
             elif dst in bar:
                 del bar[dst]
 
-        put("position", self.position or "top", "top")
+        position = self.position if self.position in POSITIONS else "top"
+        host = _safe_text(self.host, 128)
+        if not _valid_id(host):
+            host = "omarchy.bar"
+        put("position", position, "top")
         put("transparent", bool(self.transparent), False)
-        put("centerAnchor", self.anchor or "", "")
-        put("host", self.host or "omarchy.bar", "omarchy.bar")
-        put("fontFamily", self.font_family or "", "")
-        put("scaleWithFont", self.scale_font, True)
+        put("centerAnchor", _safe_text(self.anchor, 256), "")
+        put("host", host, "omarchy.bar")
+        put("fontFamily", _safe_text(self.font_family, 256), "")
+        put("scaleWithFont", bool(self.scale_font), True)
 
         if self.screensaver or self.lock or "idle" in cfg:
-            idle = cfg.setdefault("idle", {})
-            idle["screensaver"] = self.screensaver
-            idle["lock"] = self.lock
+            idle = cfg.get("idle")
+            if not isinstance(idle, dict):
+                idle = {}
+                cfg["idle"] = idle
+            idle["screensaver"] = max(0, min(86400, int(self.screensaver)))
+            idle["lock"] = max(0, min(86400, int(self.lock)))
         return cfg
 
     def gather_toml(self):
+        colors = []
+        for value in (self.bg, self.text_col, self.active):
+            if not _valid_color(value):
+                raise ValueError("invalid color")
+            colors.append(value)
+        alpha = float(self.alpha) / 100.0
+        if not math.isfinite(alpha):
+            raise ValueError("invalid alpha")
         return {
-            "background": self.bg,
-            "background_alpha": self.alpha / 100.0,
-            "text": self.text_col,
-            "active": self.active,
-            "scale_with_font": self.scale_font,
-            "size_horizontal": self.size_h,
-            "size_vertical": self.size_v,
+            "background": colors[0],
+            "background_alpha": max(0.0, min(1.0, alpha)),
+            "text": colors[1],
+            "active": colors[2],
+            "scale_with_font": bool(self.scale_font),
+            "size_horizontal": max(1, min(1000, int(self.size_h))),
+            "size_vertical": max(1, min(1000, int(self.size_v))),
         }
 
     def save(self):
-        io_write(self.gather_cfg(), self.gather_toml())
+        written = io_write(self.gather_cfg(), self.gather_toml(), self.disk_cfg)
+        if written is not None:
+            self.cfg = ensure_cfg(copy.deepcopy(written))
+            self.disk_cfg = copy.deepcopy(written)
         self.dirty = False
         self.status = "Saved — the shell reloads automatically"
 
-    def reset_bar(self):
-        rc, out, err = run(["omarchy", "bar", "defaults"])
+    def reset_bar(self, force=False):
+        if self.dirty and not force:
+            self.status = "Unsaved changes — confirm reset"
+            return False
+        rc, out, err = run([OMARCHY_PATH, "bar", "defaults"], timeout=15)
         if rc != 0:
             self.status = "Reset failed"
-            return
+            return False
         self.load()
         self.status = "Reset to default Omarchy bar"
+        return True
 
     def toggle_bar(self):
-        rc, out, err = run(["omarchy", "toggle", "bar"])
+        rc, out, err = run([OMARCHY_PATH, "toggle", "bar"])
         self.status = "Bar visibility toggled" if rc == 0 else "Toggle failed"
 
-    def reload(self):
+    def reload(self, force=False):
+        if self.dirty and not force:
+            self.status = "Unsaved changes — confirm reload"
+            return False
         self.load()
         self.status = "Reloaded from disk"
+        return True
 
     def plugin_set(self, pid, enable):
+        if not _valid_id(pid) or not isinstance(enable, bool) or self.states.get(pid) is None:
+            self.status = "Plugin state is unknown"
+            return False
         rc, out, err = run(
-            ["omarchy", "plugin", "enable" if enable else "disable", pid])
-        if rc == 0:
-            try:
-                self.states = load_plugin_states()
-            except Exception:
-                pass
-            self.status = f"{pid} {'enabled' if enable else 'disabled'}"
-        else:
+            [OMARCHY_PATH, "plugin", "enable" if enable else "disable", str(pid)])
+        if rc != 0:
             self.status = f"Could not {'enable' if enable else 'disable'} {pid}"
+            return False
+        states = load_plugin_states()
+        if states is None:
+            self.states = dict(self.states)
+            self.states[pid] = enable
+        else:
+            self.states = states
+        self.status = f"{pid} {'enabled' if enable else 'disabled'}"
+        return True
 
     # -- layout edits ------------------------------------------------------
     def mark_dirty(self):
@@ -441,139 +864,257 @@ class Model:
         self.status = "Unsaved changes"
 
     def add_widget(self, sec, wid):
+        if sec not in SECTIONS or not _valid_id(wid) or len(self.layout[sec]) >= 1000:
+            return False
         self.push_history()
-        self.layout[sec].append({"id": wid})
+        self.layout[sec].append({"id": str(wid)})
         self.mark_dirty()
+        return True
 
     def remove_widget(self, sec, idx):
-        if not (0 <= idx < len(self.layout[sec])):
-            return
+        if sec not in SECTIONS or not (0 <= idx < len(self.layout[sec])):
+            return False
         self.push_history()
         del self.layout[sec][idx]
         self.mark_dirty()
+        return True
 
     def move_widget(self, sec, idx, delta):
+        if sec not in SECTIONS or delta not in (-1, 1):
+            return False
         lst = self.layout[sec]
         target = idx + delta
         if not (0 <= idx < len(lst)) or not (0 <= target < len(lst)):
-            return
+            return False
         self.push_history()
         lst[idx], lst[target] = lst[target], lst[idx]
         self.mark_dirty()
+        return True
 
     def move_section(self, sec, idx, target_sec):
-        if not target_sec or target_sec == sec:
-            return
-        if not (0 <= idx < len(self.layout[sec])):
-            return
+        if sec not in SECTIONS or target_sec not in SECTIONS or target_sec == sec:
+            return False
+        if not (0 <= idx < len(self.layout[sec])) or len(self.layout[target_sec]) >= 1000:
+            return False
         self.push_history()
         item = self.layout[sec].pop(idx)
         self.layout[target_sec].append(item)
         self.mark_dirty()
+        return True
 
     def drop_widget(self, src_sec, src_idx, dst_sec, dst_idx):
-        """Move a widget to another section (or reorder in place), inserting at
-        dst_idx (== len(dst) appends). Returns the widget's new index."""
         if src_sec not in SECTIONS or dst_sec not in SECTIONS:
             return None
         src = self.layout[src_sec]
-        if not (0 <= src_idx < len(src)):
+        dst = self.layout[dst_sec]
+        if not (0 <= src_idx < len(src)) or len(dst) >= 1000:
+            return None
+        try:
+            target = int(dst_idx)
+        except (TypeError, ValueError):
             return None
         self.push_history()
         item = src.pop(src_idx)
-        dst = self.layout[dst_sec]
-        pos = max(0, min(dst_idx, len(dst)))
+        if src_sec == dst_sec and src_idx < target:
+            target -= 1
+        pos = max(0, min(target, len(dst)))
         dst.insert(pos, item)
         self.mark_dirty()
         return pos
 
     def duplicate_widget(self, sec, idx):
-        if not (0 <= idx < len(self.layout[sec])):
-            return
+        if sec not in SECTIONS or not (0 <= idx < len(self.layout[sec])) or len(self.layout[sec]) >= 1000:
+            return False
         self.push_history()
-        item = self.layout[sec][idx]
-        copy = json.loads(json.dumps(item)) if isinstance(item, dict) else {"id": item}
-        self.layout[sec].append(copy)
+        item = copy.deepcopy(self.layout[sec][idx])
+        self.layout[sec].append(item)
         self.mark_dirty()
+        return True
 
     def widget_schema(self, wid):
         info = widget_info(self.catalog, wid)
-        bw = info.get("barWidget") or {}
-        s = bw.get("schema")
-        if isinstance(s, dict):
-            s = [s]
-        if not isinstance(s, list):
+        bw = info.get("barWidget") if isinstance(info.get("barWidget"), dict) else {}
+        schema = bw.get("schema")
+        if isinstance(schema, dict):
+            schema = [schema]
+        if not isinstance(schema, list):
             return []
-        return [f for f in s if isinstance(f, dict) and f.get("key")]
+        result = []
+        for raw in schema[:256]:
+            if not isinstance(raw, dict) or not _valid_id(raw.get("key")):
+                continue
+            field_type = str(raw.get("type") or "text").lower()
+            if field_type not in ("string", "text", "enum", "bool", "boolean", "int", "integer", "number", "float", "double"):
+                continue
+            field = {
+                "key": str(raw["key"]),
+                "type": field_type,
+                "label": _safe_text(raw.get("label"), 256) or str(raw["key"]),
+                "options": [],
+            }
+            options = raw.get("options")
+            if isinstance(options, list):
+                for option in options[:256]:
+                    if isinstance(option, (str, int, float, bool)) and not (isinstance(option, float) and not math.isfinite(option)):
+                        field["options"].append(str(option)[:256])
+            default = raw.get("defaultValue")
+            if default is not None:
+                if field_type == "bool" and not isinstance(default, bool):
+                    continue
+                if field_type in ("int", "integer") and (isinstance(default, bool) or not isinstance(default, (int, float)) or not math.isfinite(float(default))):
+                    continue
+                if field_type in ("number", "float", "double") and (isinstance(default, bool) or not isinstance(default, (int, float)) or not math.isfinite(float(default))):
+                    continue
+                if field_type in ("string", "text", "enum") and not isinstance(default, str):
+                    continue
+                field["defaultValue"] = str(default)[:4096]
+            bounds = []
+            for bound in ("min", "max"):
+                value = raw.get(bound)
+                if value is None:
+                    bounds.append(None)
+                    continue
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                    bounds.append(None)
+                    continue
+                bounds.append(value)
+            if bounds[0] is not None and bounds[1] is not None and bounds[0] > bounds[1]:
+                continue
+            field["min"], field["max"] = bounds
+            result.append(field)
+        return result
 
     def widget_options(self, sec, idx):
+        if sec not in SECTIONS or not (0 <= idx < len(self.layout[sec])):
+            return []
         entry = self.layout[sec][idx]
         if not isinstance(entry, dict):
             entry = {}
-        wid = entry_id(self.layout[sec][idx])
+        wid = entry_id(entry)
         opts = []
-        for f in self.widget_schema(wid):
-            key = f["key"]
-            value = entry.get(key)
-            if value is None:
-                value = f.get("defaultValue")
+        for field in self.widget_schema(wid):
+            key = field["key"]
+            value = entry.get(key, field.get("defaultValue"))
+            options = field.get("options") or []
             opts.append({
                 "key": key,
-                "label": f.get("label") or key,
-                "type": schema_type(f, value),
-                "enum": f.get("options") or [],
-                "min": f.get("min"),
-                "max": f.get("max"),
+                "label": _safe_text(field.get("label"), 256) or key,
+                "type": schema_type(field, value),
+                "enum": options,
+                "min": field.get("min"),
+                "max": field.get("max"),
                 "value": value,
             })
         return opts
 
     def apply_widget_option(self, sec, idx, key, value):
-        if not (0 <= idx < len(self.layout[sec])):
-            return
+        if sec not in SECTIONS or not (0 <= idx < len(self.layout[sec])) or not _valid_id(key):
+            return False
+        field = next((item for item in self.widget_schema(entry_id(self.layout[sec][idx]))
+                      if item.get("key") == key), None)
+        if field is None:
+            return False
+        kind = schema_type(field, value)
+        if kind == "enum":
+            if not isinstance(value, (str, int, float, bool)) or isinstance(value, float) and not math.isfinite(value):
+                return False
+            if str(value) not in (field.get("options") or []):
+                return False
+            value = str(value)
+        elif kind == "bool":
+            if not isinstance(value, bool):
+                return False
+        elif kind == "int":
+            if isinstance(value, bool):
+                return False
+            try:
+                number = float(value)
+                if not math.isfinite(number) or number != int(number):
+                    return False
+                value = int(number)
+            except (TypeError, ValueError, OverflowError):
+                return False
+        elif kind == "num":
+            if isinstance(value, bool):
+                return False
+            try:
+                value = float(value)
+                if not math.isfinite(value):
+                    return False
+            except (TypeError, ValueError, OverflowError):
+                return False
+        else:
+            value = _safe_text(value, 4096)
+            if not value:
+                return False
+        if kind in ("int", "num"):
+            try:
+                if field.get("min") is not None:
+                    value = max(value, field["min"])
+                if field.get("max") is not None:
+                    value = min(value, field["max"])
+            except (TypeError, ValueError, OverflowError):
+                return False
         entry = self.layout[sec][idx]
         if not isinstance(entry, dict):
-            entry = {"id": entry}
+            entry = {"id": entry_id(entry)}
             self.layout[sec][idx] = entry
         self.push_history()
         entry[key] = value
         self.mark_dirty()
+        return True
 
     def refresh_profiles(self):
-        self._profiles = load_profiles()
+        profiles = load_profiles()
+        if profiles is not None:
+            self._profiles = profiles
         return self._profiles
 
     def save_profile(self, name):
+        if not _valid_profile_name(name):
+            raise ValueError("invalid profile name")
         payload = {
             "shell": self.gather_cfg(),
             "toml": {"values": self.gather_toml()},
         }
-        rc, out, err = run(
-            [sys.executable, SHELL_IO, "profiles", "save", name], payload)
+        rc, out, err = _invoke_shell_io(["profiles", "save", str(name)], payload)
         if rc != 0:
             raise RuntimeError(err.strip() or "profile save failed")
 
-    def load_profile(self, name):
-        rc, out, err = run([sys.executable, SHELL_IO, "profiles", "load", name])
+    def load_profile(self, name, force=False):
+        if self.dirty and not force:
+            raise RuntimeError("unsaved changes require confirmation")
+        if not _valid_profile_name(name):
+            raise ValueError("invalid profile name")
+        rc, out, err = _invoke_shell_io(["profiles", "load", str(name)])
         if rc != 0:
             raise RuntimeError(err.strip() or f"no profile named {name}")
         try:
-            data = json.loads(out) if isinstance(out, str) else out
-        except json.JSONDecodeError:
+            data = _json_load(out) if isinstance(out, str) else out
+        except (json.JSONDecodeError, TypeError, RecursionError, ValueError):
             raise RuntimeError("corrupt profile")
-        if not isinstance(data, dict):
+        if not isinstance(data, dict) or not isinstance(data.get("shell"), dict):
             raise RuntimeError("corrupt profile")
-        self.cfg = ensure_cfg(data.get("shell") or {})
-        self.toml = {"values": (data.get("toml") or {}).get("values") or {},
-                     "exists": True}
+        toml = data.get("toml")
+        if not isinstance(toml, dict) or not isinstance(toml.get("values", {}), dict):
+            raise RuntimeError("corrupt profile")
+        old = self.snapshot()
+        try:
+            self.cfg = ensure_cfg(copy.deepcopy(data["shell"]))
+            self.toml = {"values": copy.deepcopy(toml.get("values", {})), "exists": True}
+            self.apply_from_cfg()
+        except Exception:
+            self.restore(old)
+            raise
         self.undo.clear()
         self.redo.clear()
-        self.apply_from_cfg()
         self.mark_dirty()
         self.status = "Loaded profile — save to apply"
 
     def delete_profile(self, name):
-        rc, out, err = run([sys.executable, SHELL_IO, "profiles", "delete", name])
+        if not _valid_profile_name(name):
+            raise ValueError("invalid profile name")
+        rc, out, err = _invoke_shell_io(["profiles", "delete", str(name)])
         if rc != 0:
             raise RuntimeError(err.strip() or f"no profile named {name}")
 
@@ -581,24 +1122,29 @@ class Model:
     def add_options(self):
         placed = {}
         for sec in SECTIONS:
-            for e in self.layout[sec]:
-                wid = entry_id(e)
+            for entry in self.layout[sec]:
+                wid = entry_id(entry)
                 if wid:
                     placed[wid] = placed.get(wid, 0) + 1
         out = []
         for wid, info in (self.catalog or {}).items():
-            if not is_bar_widget(info):
+            if not is_bar_widget(info) or not _valid_id(wid):
                 continue
-            if self.states.get(wid) is False:
+            state = self.states.get(wid)
+            if state is False:
                 continue
             if not allow_multiple(self.catalog, wid) and placed.get(wid, 0) > 0:
                 continue
-            bw = info.get("barWidget") or {}
+            bw = info.get("barWidget") if isinstance(info.get("barWidget"), dict) else {}
+            display = _safe_text(bw.get("displayName") or info.get("name") or wid, 256)
+            if state is None:
+                display += " (state unknown)"
             out.append({
                 "id": wid,
-                "name": bw.get("displayName") or info.get("name") or wid,
-                "category": bw.get("category") or "Utilities",
-                "desc": bw.get("description") or info.get("description") or "",
+                "name": display[:256],
+                "category": _safe_text(bw.get("category") or "Utilities", 64),
+                "desc": _safe_text(bw.get("description") or info.get("description") or "", 1024),
+                "state": state,
             })
         out.sort(key=lambda r: r["name"].lower())
         return out
@@ -606,16 +1152,17 @@ class Model:
     def plugins(self):
         out = []
         for wid, info in (self.catalog or {}).items():
-            if "bar-widget" not in (info.get("kinds") or []) and \
-               "overlay" not in (info.get("kinds") or []):
+            kinds = info.get("kinds") if isinstance(info, dict) and isinstance(info.get("kinds"), list) else []
+            if "bar-widget" not in kinds and "overlay" not in kinds:
                 continue
-            if wid == "davidjm.bar-editor":
+            if wid == "davidjm.bar-editor" or not _valid_id(wid):
                 continue
-            bw = info.get("barWidget") or {}
+            bw = info.get("barWidget") if isinstance(info.get("barWidget"), dict) else {}
+            state = self.states.get(wid)
             out.append({
                 "id": wid,
-                "name": bw.get("displayName") or info.get("name") or wid,
-                "enabled": self.states.get(wid) is not False,
+                "name": _safe_text(bw.get("displayName") or info.get("name") or wid, 256),
+                "enabled": state if state in (True, False) else None,
             })
         out.sort(key=lambda r: r["name"].lower())
         return out
@@ -640,6 +1187,9 @@ class BarEditorTUI:
         self.set_i = 0
         self.set_scroll = 0
         self.row_rects = [[] for _ in SECTIONS]
+        self.settings_rect = (0, 0, 0, 0)
+        self.layout_rect = (0, 0, 0, 0)
+        self.search_rect = (0, 0, 0)
         self.search = ""
         self.search_active = False
         self.drag_sec = None        # mouse drag-and-drop state
@@ -704,8 +1254,11 @@ class BarEditorTUI:
         self.max_y, self.max_x = self.s.getmaxyx()
         if self.max_y < 6 or self.max_x < 30:
             self.s.erase()
-            self.s.addnstr(0, 0, "Terminal too small", 30)
-            self.s.refresh()
+            self._put(0, 0, "Terminal too small")
+            try:
+                self.s.refresh()
+            except curses.error:
+                pass
             self.need_refresh = False
             return
         self.s.erase()
@@ -870,7 +1423,7 @@ class BarEditorTUI:
             mark = "▸" if carried else " "
             line = mark + " " + name
             if len(line) > usable:
-                line = (mark + " " + name)[: usable - 1] + "…"
+                line = ((mark + " " + name)[:max(1, usable - 1)] + "…")[:usable]
             if carried:
                 self._put(y, left, line, curses.A_BOLD, PAIR.get("accent", 0))
             elif selected:
@@ -896,8 +1449,10 @@ class BarEditorTUI:
     # prompt
     # ------------------------------------------------------------------
     def open_prompt(self, title, initial, kind, on_done):
-        self.prompt = {"title": title, "kind": kind, "on_done": on_done}
-        self.prompt_text = initial
+        if kind not in ("confirm", "int", "num", "hex", "text"):
+            return
+        self.prompt = {"title": str(title)[:256], "kind": kind, "on_done": on_done}
+        self.prompt_text = str(initial or "")[:MAX_PROMPT_CHARS]
         self.need_refresh = True
 
     def draw_prompt(self):
@@ -921,10 +1476,10 @@ class BarEditorTUI:
     def prompt_finish(self):
         p = self.prompt
         kind = p["kind"]
-        text = self.prompt_text.strip()
+        value = self.prompt_text.strip()
         if kind == "int":
             try:
-                text = int(text)
+                value = int(value)
             except ValueError:
                 self.model.status = "Not a number"
                 self.prompt = None
@@ -932,23 +1487,38 @@ class BarEditorTUI:
                 return
         elif kind == "num":
             try:
-                text = float(text)
+                value = float(value)
+                if not math.isfinite(value):
+                    raise ValueError
             except ValueError:
                 self.model.status = "Not a number"
                 self.prompt = None
                 self.need_refresh = True
                 return
         elif kind == "hex":
-            text = text.strip().lstrip("#")
-            if len(text) not in (3, 6) or any(c not in "0123456789abcdefABCDEF" for c in text):
+            value = value.lstrip("#")
+            if len(value) not in (3, 6) or any(c not in "0123456789abcdefABCDEF" for c in value):
                 self.model.status = "Bad color — use RRGGBB"
                 self.prompt = None
                 self.need_refresh = True
                 return
-            if len(text) == 3:
-                text = "".join(c * 2 for c in text)
-            text = "#" + text
-        p["on_done"](text)
+            if len(value) == 3:
+                value = "".join(c * 2 for c in value)
+            value = "#" + value
+        elif kind == "text":
+            if not value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+                self.model.status = "Invalid text"
+                self.prompt = None
+                self.need_refresh = True
+                return
+        try:
+            p["on_done"](value)
+        except Exception as exc:
+            self.model.status = f"Action failed: {exc}"
+            self.prompt = None
+            self.prompt_text = ""
+            self.need_refresh = True
+            return
         self.prompt = None
         self.prompt_text = ""
         self.need_refresh = True
@@ -962,8 +1532,14 @@ class BarEditorTUI:
             self.key_prompt(ch)
             return
         if self.ov:
-            self.ov.key(self.s, ch)
+            try:
+                self.ov.key(self.s, ch)
+            except Exception as exc:
+                self.model.status = f"Action failed: {exc}"
             self.need_refresh = True
+            return
+        if self.search_active and self.side == "layout":
+            self.key_search(ch)
             return
 
         if ctrl == 19:  # Ctrl+S
@@ -972,10 +1548,14 @@ class BarEditorTUI:
             except Exception as e:
                 self.model.status = f"Save failed: {e}"
         elif ctrl == 18:  # Ctrl+R
-            try:
-                self.model.reload()
-            except Exception as e:
-                self.model.status = f"Reload failed: {e}"
+            if self.model.dirty:
+                self.open_prompt("Discard unsaved changes and reload?", "", "confirm",
+                                 lambda v: self._do_reload())
+            else:
+                try:
+                    self.model.reload()
+                except Exception as e:
+                    self.model.status = f"Reload failed: {e}"
         elif ctrl == 26:  # Ctrl+Z
             self.model.undo_step()
         elif ctrl == 25:  # Ctrl+Y
@@ -1013,9 +1593,24 @@ class BarEditorTUI:
             self.prompt_finish()
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
             self.prompt_text = self.prompt_text[:-1]
-        elif 32 <= ch <= 0x10FFFF:
+        elif 32 <= ch <= 0x10FFFF and len(self.prompt_text) < MAX_PROMPT_CHARS:
             try:
                 self.prompt_text += chr(ch)
+            except ValueError:
+                pass
+        self.need_refresh = True
+
+    def key_search(self, ch):
+        if ch == 27:
+            self.search_active = False
+            self.search = ""
+        elif ch in (10, ord("\n"), 13):
+            self.search_active = False
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            self.search = self.search[:-1]
+        elif 32 <= ch <= 0x10FFFF and len(self.search) < 128:
+            try:
+                self.search += chr(ch)
             except ValueError:
                 pass
         self.need_refresh = True
@@ -1023,6 +1618,11 @@ class BarEditorTUI:
     def key_layout(self, ch):
         sec = SECTIONS[self.sec_i]
         lst = self.model.layout[sec]
+        if ch == ord("/"):
+            self.search_active = True
+            self.search = ""
+            self.need_refresh = True
+            return
         mod = []
         if ch in (curses.KEY_UP, ord("k"), ord("K")) and self.sel_sec is not None:
             if self._move_selected_vertical(-1):
@@ -1127,6 +1727,7 @@ class BarEditorTUI:
 
     def key_settings(self, ch):
         rows = self.settings_rows()
+        self.set_i = max(0, min(len(rows) - 1, self.set_i))
         if ch in (curses.KEY_UP, ord("k"), ord("K")):
             if self.set_i > 0:
                 self.set_i -= 1
@@ -1142,6 +1743,8 @@ class BarEditorTUI:
         self.need_refresh = True
 
     def edit_setting(self, kind):
+        if kind == "--":
+            return
         m = self.model
         def f(attr):
             def setter(val):
@@ -1150,15 +1753,19 @@ class BarEditorTUI:
                         val = int(val)
                     except (TypeError, ValueError):
                         return
-                    if attr == "alpha":
+                    if attr in ("screensaver", "lock"):
+                        val = max(0, min(86400, val))
+                    elif attr == "alpha":
                         val = max(0, min(100, val))
-                    elif attr in ("screensaver", "lock"):
-                        val = max(0, val)
-                    elif attr in ("size_h", "size_v"):
-                        val = max(1, val)
-                cur = getattr(m, attr)
-                if val != cur:
-                    m.push_history()
+                    else:
+                        val = max(1, min(1000, val))
+                elif attr in ("anchor", "font_family"):
+                    val = _safe_text(val, 256)
+                    if not val and attr == "anchor":
+                        val = ""
+                if val == getattr(m, attr):
+                    return
+                m.push_history()
                 setattr(m, attr, val)
                 m.mark_dirty()
                 self.need_refresh = True
@@ -1194,8 +1801,11 @@ class BarEditorTUI:
             self.open_prompt("Vertical size (px)", str(m.size_v), "int", f("size_v"))
 
     def _set_toggle(self, attr, val):
+        value = bool(val)
+        if getattr(self.model, attr) == value:
+            return
         self.model.push_history()
-        setattr(self.model, attr, bool(val))
+        setattr(self.model, attr, value)
         self.model.mark_dirty()
         self.need_refresh = True
 
@@ -1240,7 +1850,11 @@ class BarEditorTUI:
         self.need_refresh = True
 
     def _toggle_plugin(self, row):
-        self.model.plugin_set(row["id"], not row["enabled"])
+        if row.get("enabled") is None:
+            self.model.status = "Plugin state is unknown"
+            self.need_refresh = True
+            return
+        self.model.plugin_set(row.get("id"), not row["enabled"])
         if self.ov:
             self.ov.rows = self.model.plugins()
         self.need_refresh = True
@@ -1345,13 +1959,21 @@ class BarEditorTUI:
         return [{"name": n, "label": n} for n in self.model.refresh_profiles()]
 
     def _load_profile(self, row):
+        name = row.get("name") if isinstance(row, dict) else ""
+        if not _valid_profile_name(name):
+            self.model.status = "Invalid profile name"
+            return
+        if self.model.dirty:
+            self.open_prompt("Discard unsaved changes and load profile?", "", "confirm",
+                             lambda v: self._do_load_profile(name))
+            return
+        self._do_load_profile(name)
+
+    def _do_load_profile(self, name):
         try:
-            self.model.load_profile(row["name"])
+            self.model.load_profile(name, force=True)
         except Exception as e:
-            if str(e):
-                self.model.status = f"{e}"
-            else:
-                self.model.status = "Profile load failed"
+            self.model.status = f"{e}" if str(e) else "Profile load failed"
         self.ov = None
         self.need_refresh = True
 
@@ -1374,19 +1996,22 @@ class BarEditorTUI:
         self.need_refresh = True
 
     def _delete_profile(self, row):
-        name = row["name"]
-        if self.pending_delete == name:
-            try:
-                self.model.delete_profile(name)
-                self.model.status = f"Profile {name} deleted"
-            except Exception as e:
-                self.model.status = f"Delete failed: {e}"
-            self.pending_delete = None
-            self.ov.rows = self._profile_rows()
-            self.ov.sel = min(self.ov.sel, max(0, len(self.ov.rows) - 1))
-        else:
-            self.pending_delete = name
-            self.model.status = f"Press x again to delete profile {name}"
+        name = row.get("name") if isinstance(row, dict) else ""
+        if not _valid_profile_name(name):
+            self.model.status = "Invalid profile name"
+            return
+        self.open_prompt(f"Delete profile {name}?", "", "confirm",
+                         lambda v: self._do_delete_profile(name))
+        self.need_refresh = True
+
+    def _do_delete_profile(self, name):
+        try:
+            self.model.delete_profile(name)
+            self.model.status = f"Profile {name} deleted"
+        except Exception as e:
+            self.model.status = f"Delete failed: {e}"
+        self.pending_delete = None
+        self.ov = None
         self.need_refresh = True
 
     def action_reset(self):
@@ -1395,7 +2020,7 @@ class BarEditorTUI:
 
     def _do_reset(self):
         try:
-            self.model.reset_bar()
+            self.model.reset_bar(force=True)
         except Exception as e:
             self.model.status = f"Reset failed: {e}"
         self.need_refresh = True
@@ -1407,6 +2032,13 @@ class BarEditorTUI:
         else:
             self.running = False
 
+    def _do_reload(self):
+        try:
+            self.model.reload(force=True)
+        except Exception as e:
+            self.model.status = f"Reload failed: {e}"
+        self.need_refresh = True
+
     def _done(self):
         self.running = False
 
@@ -1415,14 +2047,20 @@ class BarEditorTUI:
     # ------------------------------------------------------------------
     def mouse(self, event):
         try:
-            mx, my, bstate = event.x, event.y, event.bstate
-        except AttributeError:
-            return
+            _, mx, my, _, bstate = event
+        except (TypeError, ValueError):
+            try:
+                mx, my, bstate = event.x, event.y, event.bstate
+            except AttributeError:
+                return
         if mx < 0 or mx >= self.max_x or my < 0 or my >= self.max_y:
             return
         if self.prompt or self.ov:
             if self.ov:
-                self.ov.mouse(self.s, my, mx, bstate)
+                try:
+                    self.ov.mouse(self.s, my, mx, bstate)
+                except Exception as exc:
+                    self.model.status = f"Action failed: {exc}"
                 self.need_refresh = True
             return
 
@@ -1553,26 +2191,27 @@ class ListOverlay:
         parts = [str(r.get(k)) for k in (self.fields or {}).values() if r.get(k) is not None]
         return " · ".join(parts)
 
-    @staticmethod
-    def _safe_add(s, y, x, text, w, attr=0):
+    def _put(self, s, y, x, text, attr=0):
         try:
-            s.addnstr(y, x, text, w, attr)
+            s.addnstr(y, x, text, max(0, s.getmaxyx()[1] - x), attr)
         except curses.error:
             pass
 
     def draw(self, s):
         h, w = s.getmaxyx()
-        ph = max(6, min(18, h - 6))
-        pw = max(30, min(min(72, w - 8), w - 1))
-        pw = min(pw, w - 1)
-        top = max(1, (h - ph) // 2)
-        left = max(1, (w - pw) // 2)
+        if h < 6 or w < 20:
+            return
+        ph = max(4, min(18, h - 2))
+        pw = max(20, min(72, w - 2))
+        pw = min(pw, w - 2)
+        top = max(0, min(h - ph - 1, (h - ph) // 2))
+        left = max(0, min(w - pw - 1, (w - pw) // 2))
         bot = top + ph - 1
 
         # body
-        self._safe_add(s, top, left, "┌" + "─" * (pw - 2) + "┐", w, 0)
-        self._safe_add(s, top + 1, left, f"│ {self.title[: pw - 4].ljust(pw - 4)} │", w, 0)
-        self._safe_add(s, top + 2, left, f"│ {('Search: ' + self.filter + '▏').ljust(pw - 4)[: pw - 4]} │", w, 0)
+        self._put(s, top, left, "┌" + "─" * (pw - 2) + "┐")
+        self._put(s, top + 1, left, f"│ {self.title[: pw - 4].ljust(pw - 4)} │")
+        self._put(s, top + 2, left, f"│ {('Search: ' + self.filter + '▏').ljust(pw - 4)[: pw - 4]} │")
 
         items = self.filtered()
         body_h = ph - 4
@@ -1589,19 +2228,19 @@ class ListOverlay:
                 break
             r = items[idx]
             mark = "▸" if idx == self.sel else " "
-            cb = ("✓" if r.get("enabled") else "·") if self.checkbox else ""
+            cb = ("?" if r.get("enabled") is None else ("✓" if r.get("enabled") else "·")) if self.checkbox else ""
             line = f"│ {mark} {cb} {self._label(r)}".ljust(pw - 1) + "│"
-            try:
-                if idx == self.sel:
-                    s.addnstr(y, left, line, w, curses.A_REVERSE)
-                else:
-                    s.addnstr(y, left, line, w, 0)
-            except curses.error:
-                pass
+            if idx == self.sel:
+                self._put(s, y, left, line, curses.A_REVERSE)
+            else:
+                self._put(s, y, left, line)
         if not items:
-            self._safe_add(s, top + 3, left, f"│ {self.empty}".ljust(pw - 1) + "│", w, 0)
-        self._safe_add(s, bot, left, "└" + "─" * (pw - 2) + "┘", w, 0)
-        s.refresh()
+            self._put(s, top + 3, left, f"│ {self.empty}".ljust(pw - 1) + "│")
+        self._put(s, bot, left, "└" + "─" * (pw - 2) + "┘")
+        try:
+            s.refresh()
+        except curses.error:
+            pass
 
     def key(self, s, ch):
         items = self.filtered()
@@ -1626,8 +2265,8 @@ class ListOverlay:
             if self.sel > 0:
                 self.sel -= 1
         elif ch in (curses.KEY_DOWN, ord("j"), ord("J")):
-            self.sel = min(len(items) - 1, self.sel + 1)
-        elif 32 <= ch <= 0x10FFFF:
+            self.sel = min(max(0, len(items) - 1), self.sel + 1)
+        elif 32 <= ch <= 0x10FFFF and len(self.filter) < 256:
             try:
                 self.filter += chr(ch)
             except ValueError:
@@ -1665,22 +2304,16 @@ def init_colors():
         PAIR.setdefault(k, PAIR.get(v, 0))
 
 
-def _main(stdscr):
-    curses.curs_set(0)
-    # disable IXON so Ctrl+S / Ctrl+Q reach curses (not swallowed as XON/XOFF)
-    try:
-        fd = sys.stdin.fileno()
-        attrs = termios.tcgetattr(fd)
-        attrs[0] &= ~(termios.IXON | termios.IXOFF)
-        termios.tcsetattr(fd, termios.TCSANOW, attrs)
-    except termios.error:
-        pass
+def _run_app(stdscr):
     if curses.has_colors():
         init_colors()
-    curses.mousemask(
-        curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED |
-        curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED |
-        curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
+    try:
+        curses.mousemask(
+            curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED |
+            curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED |
+            curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
+    except curses.error:
+        pass
 
     model = Model()
     try:
@@ -1705,6 +2338,35 @@ def _main(stdscr):
         if app.ov and getattr(app.ov, "need_close", False):
             app.ov = None
             app.need_refresh = True
+
+
+def _main(stdscr):
+    old_attrs = None
+    fd = None
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    try:
+        fd = sys.stdin.fileno()
+        old_attrs = termios.tcgetattr(fd)
+        attrs = termios.tcgetattr(fd)
+        attrs[0] &= ~(termios.IXON | termios.IXOFF)
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except (termios.error, OSError, ValueError):
+        old_attrs = None
+    try:
+        if _shell_io is not None:
+            with _shell_io.instance_lock():
+                _run_app(stdscr)
+        else:
+            _run_app(stdscr)
+    finally:
+        if old_attrs is not None and fd is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSANOW, old_attrs)
+            except (termios.error, OSError):
+                pass
 
 
 def run_tui():

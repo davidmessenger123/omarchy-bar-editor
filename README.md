@@ -37,9 +37,18 @@ omarchy bar put davidjm.bar-editor
 | `~/.config/omarchy/shell.toml` | `[bar]` colors, alpha, sizing |
 | `~/.config/omarchy/shell.toml.bak-editor` | Backup created on every save |
 | `~/.config/omarchy/bar-profiles/` | Saved profiles (`Ctrl+P`) |
+| `~/.config/omarchy/.shell.json.transaction.json` | Shared short-lived crash-recovery journal |
+| `~/.config/omarchy/.shell.json.lock` | Shared `shell.json` transaction lock |
+| `~/.config/omarchy/.bar-editor.instance.lock` | Nonblocking single-editor lock |
 
-All writes go through `shell_io.py` (atomic replace, symlink-safe), never from
-the UI directly.
+All writes go through `shell_io.py` (locked, re-read, durable transaction
+journal plus atomic replace, crash recovery, and symlink-safe checks), never
+from the UI directly. The shared lock and journal interoperate with the Boost
+and Rain settings writers. Stale editor saves use a three-way merge, preserving
+unrelated concurrent changes and rejecting overlapping conflicts. A
+nonblocking instance lock prevents two editors from overwriting each other.
+Input, JSON, and TOML line/depth/size limits are checked before parsing or
+writing.
 
 ## Features
 
@@ -97,7 +106,8 @@ Validate locally:
 
 ```sh
 omarchy plugin validate .
-python3 -m py_compile editor_tui.py
+python3 -m py_compile editor_tui.py shell_io.py
+python3 -m unittest discover -s tests
 ```
 
 ## License

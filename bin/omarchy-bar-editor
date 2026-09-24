@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Omarchy Bar Editor — terminal launcher.
 #
 # Runs the bar editor as a TUI (stdlib curses, mouse-aware) inside the user's
@@ -8,7 +8,7 @@
 # application window.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-exec python3 "$PLUGIN_DIR/editor_tui.py" "$@"
+exec /usr/bin/python3 -I "$PLUGIN_DIR/editor_tui.py" "$@"
