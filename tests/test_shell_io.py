@@ -288,7 +288,7 @@ os.close(dir_fd)
                     env=env,
                 )
                 editor.stdin.write(json.dumps(payload))
-                editor.stdin.close()
+                editor.stdin.flush()
                 time.sleep(0.1)
                 self.assertIsNone(editor.poll())
                 gate.touch()
