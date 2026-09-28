@@ -538,6 +538,60 @@ def _num_str(values, key, default):
     return str(value)[:256]
 
 
+# Bare numbers are seconds; units may be given alone ("5m") or chained
+# ("1h30m"). Seconds and minutes may be fractional ("1.5m" -> 90).
+DURATION_UNITS = {
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+}
+DURATION_SHAPE = re.compile(r"^(?:\s*\d+(?:\.\d+)?\s*[a-z]*)+$")
+DURATION_TOKEN = re.compile(r"(\d+(?:\.\d+)?)\s*([a-z]*)")
+DURATION_ORDER = (("d", 86400), ("h", 3600), ("m", 60))
+
+
+def parse_duration(text):
+    """Parse a human duration into whole seconds. Raises ValueError."""
+    raw = str(text or "").strip().lower().replace(",", "")
+    if not raw:
+        raise ValueError("empty")
+    if not DURATION_SHAPE.match(raw):
+        raise ValueError("malformed")
+    tokens = DURATION_TOKEN.findall(raw)
+    # A lone bare number means seconds, but a bare trailing component in a
+    # compound expression is ambiguous ("1h30"), so require a unit for it.
+    if len(tokens) > 1 and any(not unit for _, unit in tokens[1:]):
+        raise ValueError("ambiguous")
+    total = 0.0
+    for number, unit in tokens:
+        factor = DURATION_UNITS.get(unit or "s")
+        if factor is None:
+            raise ValueError("unknown unit")
+        total += float(number) * factor
+    if not math.isfinite(total):
+        raise ValueError("not finite")
+    return int(round(total))
+
+
+def format_duration(seconds):
+    """Render seconds compactly, e.g. 300 -> '5m', 150 -> '2m30s'."""
+    try:
+        total = int(seconds)
+    except (TypeError, ValueError):
+        return str(seconds)
+    if total <= 0:
+        return "0s"
+    parts = []
+    for label, size in DURATION_ORDER:
+        if total >= size:
+            count, total = divmod(total, size)
+            parts.append(f"{count}{label}")
+    if total:
+        parts.append(f"{total}s")
+    return "".join(parts)
+
+
 def schema_type(field, value=None):
     t = str(field.get("type") or "").lower()
     if t == "enum":
@@ -1295,8 +1349,8 @@ class BarEditorTUI:
             ("host", "Bar host", m.host),
             ("font", "Font family", m.font_family or "(system)"),
             ("--", "─", ""),
-            ("screensaver", "Screensaver (s)", str(m.screensaver)),
-            ("lock", "Lock (s)", str(m.lock)),
+            ("screensaver", "Screensaver delay", format_duration(m.screensaver)),
+            ("lock", "Lock delay", format_duration(m.lock)),
             ("--", "─", ""),
             ("bg", "Background", m.bg),
             ("text", "Text", m.text_col),
@@ -1449,7 +1503,7 @@ class BarEditorTUI:
     # prompt
     # ------------------------------------------------------------------
     def open_prompt(self, title, initial, kind, on_done):
-        if kind not in ("confirm", "int", "num", "hex", "text"):
+        if kind not in ("confirm", "int", "num", "hex", "text", "duration"):
             return
         self.prompt = {"title": str(title)[:256], "kind": kind, "on_done": on_done}
         self.prompt_text = str(initial or "")[:MAX_PROMPT_CHARS]
@@ -1457,15 +1511,19 @@ class BarEditorTUI:
 
     def draw_prompt(self):
         h, w = self.max_y, self.max_x
-        ph = 4 if self.prompt["kind"] == "confirm" else 3
+        kind = self.prompt["kind"]
+        ph = 4 if kind in ("confirm", "duration") else 3
         pw = min(60, max(24, w - 8))
         top = max(1, (h - ph) // 2)
         left = max(1, (w - pw) // 2)
         self._fill_box(top, left, top + ph - 1, left + pw - 1, self.prompt["title"])
-        body = self.prompt_text + ("█" if self.prompt["kind"] != "confirm" else "")
+        body = self.prompt_text + ("█" if kind != "confirm" else "")
         self._put(top + 1, left + 2, body[: max(0, pw - 4)])
-        if self.prompt["kind"] == "confirm":
+        if kind == "confirm":
             self._put(top + 2, left + 2, "y/Y confirm · n/N or Esc cancel", 0,
+                      PAIR.get("dim", 0))
+        elif kind == "duration":
+            self._put(top + 2, left + 2, "seconds or units: 300 · 5m · 1h30m", 0,
                       PAIR.get("dim", 0))
 
     def _fill_box(self, top, left, bottom, right, title):
@@ -1482,6 +1540,14 @@ class BarEditorTUI:
                 value = int(value)
             except ValueError:
                 self.model.status = "Not a number"
+                self.prompt = None
+                self.need_refresh = True
+                return
+        elif kind == "duration":
+            try:
+                value = parse_duration(value)
+            except ValueError:
+                self.model.status = "Bad duration — use 300, 5m, or 1h30m"
                 self.prompt = None
                 self.need_refresh = True
                 return
@@ -1784,9 +1850,11 @@ class BarEditorTUI:
         elif kind == "font":
             self.open_prompt("Font family", m.font_family, "text", f("font_family"))
         elif kind == "screensaver":
-            self.open_prompt("Screensaver seconds", str(m.screensaver), "int", f("screensaver"))
+            self.open_prompt("Screensaver delay", format_duration(m.screensaver),
+                             "duration", f("screensaver"))
         elif kind == "lock":
-            self.open_prompt("Lock seconds", str(m.lock), "int", f("lock"))
+            self.open_prompt("Lock delay", format_duration(m.lock),
+                             "duration", f("lock"))
         elif kind == "bg":
             self.open_prompt("Background color (RRGGBB)", m.bg, "hex", f("bg"))
         elif kind == "text":

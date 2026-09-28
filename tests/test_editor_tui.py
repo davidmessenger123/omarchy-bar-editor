@@ -189,5 +189,51 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(model.move_section("left", 0, "outside"))
 
 
+class DurationTests(unittest.TestCase):
+    def test_plain_numbers_are_seconds(self):
+        for text in ("300", " 300 ", "0", "1,200"):
+            self.assertEqual(editor_tui.parse_duration(text), int(text.replace(",", "")))
+
+    def test_units_singular_plural_and_bare(self):
+        cases = {
+            "45s": 45, "45sec": 45, "45 seconds": 45,
+            "5m": 300, "5min": 300, "5 minutes": 300,
+            "1h": 3600, "1hr": 3600, "1 hour": 3600,
+            "1d": 86400, "2days": 172800,
+        }
+        for text, expected in cases.items():
+            self.assertEqual(editor_tui.parse_duration(text), expected, text)
+
+    def test_compound_and_fractional_durations(self):
+        cases = {
+            "1h30m": 5400, "1h 30m": 5400, "1h30m10s": 5410,
+            "1.5m": 90, "0.5h": 1800, "2h45m": 9900,
+        }
+        for text, expected in cases.items():
+            self.assertEqual(editor_tui.parse_duration(text), expected, text)
+
+    def test_invalid_input_is_rejected(self):
+        for text in ("", "   ", "abc", "-5", "5x", "1h-30m", "5m junk",
+                     "1.2.3", "1e5", "--", "1h30", "0x10"):
+            with self.assertRaises(ValueError, msg=text):
+                editor_tui.parse_duration(text)
+
+    def test_round_trip_through_format(self):
+        for seconds in (0, 1, 45, 60, 90, 300, 3600, 5400, 86400, 90061):
+            text = editor_tui.format_duration(seconds)
+            self.assertEqual(editor_tui.parse_duration(text), seconds, text)
+
+    def test_format_is_compact_and_ordered(self):
+        self.assertEqual(editor_tui.format_duration(0), "0s")
+        self.assertEqual(editor_tui.format_duration(300), "5m")
+        self.assertEqual(editor_tui.format_duration(150), "2m30s")
+        self.assertEqual(editor_tui.format_duration(5400), "1h30m")
+        self.assertEqual(editor_tui.format_duration(86400), "1d")
+
+    def test_format_tolerates_bad_values(self):
+        self.assertEqual(editor_tui.format_duration(None), "None")
+        self.assertEqual(editor_tui.format_duration("bad"), "bad")
+
+
 if __name__ == "__main__":
     unittest.main()

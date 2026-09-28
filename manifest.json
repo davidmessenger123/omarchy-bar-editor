@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "davidjm.bar-editor",
   "name": "Bar Editor",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "David JM",
   "license": "MIT",
   "description": "Terminal editor for the Omarchy bar: layout widgets across the left/center/right sections, bar position and transparency, idle timeouts, and [bar] styling in shell.toml.",

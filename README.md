@@ -53,7 +53,8 @@ writing.
 ## Features
 
 - Bar position, transparency, center anchor
-- Screensaver / lock idle timeouts
+- Screensaver / lock idle timeouts, accepting either plain seconds or unit
+  suffixes (`5m`, `1h`, `1h30m`, `1.5m`) and displayed in the friendliest form
 - Widget layout editing for the left / center / right sections:
   add, remove, reorder (up/down), and move between sections
 - Add-widget search overlay (filters the installed widget catalog)
